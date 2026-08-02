@@ -1,0 +1,49 @@
+Screen {
+    background: $background;
+    color: $foreground;
+}
+
+Horizontal {
+    width: 100%;
+}
+
+#options {
+    background: $panel;
+    color: $accent;
+    padding: 0 2;
+    border: solid $border-blurred;
+}
+
+#input {
+    background: $panel;
+    border: solid $border-blurred;
+    padding: 0 1;
+    /*margin: 0 0 1 0;*/
+}
+#input:focus {
+    border: solid $border;
+}
+
+#left_panel {
+    width: 1fr;
+    height: 1fr;
+    background: $panel;
+    border: solid $border-blurred;
+    padding: 0 2;
+    /*margin: 0 0 1 0;*/
+}
+#left_panel:focus-within {
+    border: solid $border;
+}
+
+#right_panel {
+    width: 66%;
+    height: 1fr;
+    background: $panel;
+    border: solid $border-blurred;
+    padding: 1 2;
+    /*margin: 0 0 1 0;*/
+}
+#right_panel:focus-within {
+    border: solid $border;
+}

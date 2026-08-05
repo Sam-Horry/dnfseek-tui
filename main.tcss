@@ -9,8 +9,7 @@ Horizontal {
 
 #options {
     background: $panel;
-    color: $accent;
-    padding: 0 2;
+    padding: 0 1;
     border: solid $border-blurred;
 }
 
@@ -29,7 +28,7 @@ Horizontal {
     height: 1fr;
     background: $panel;
     border: solid $border-blurred;
-    padding: 0 2;
+    padding: 0 1;
     /*margin: 0 0 1 0;*/
 }
 #left_panel:focus-within {
@@ -45,5 +44,20 @@ Horizontal {
     /*margin: 0 0 1 0;*/
 }
 #right_panel:focus-within {
+    border: solid $border;
+}
+
+PasswordScreen {
+    align: center middle;
+}
+
+PasswordScreen #password {
+    width: 40;
+    background: $panel;
+    border: solid $border-blurred;
+    padding: 0 1;
+}
+
+PasswordScreen #password:focus {
     border: solid $border;
 }

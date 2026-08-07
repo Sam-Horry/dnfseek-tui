@@ -632,7 +632,7 @@ class DnfseekApp(App):
         self.query_one("#options_text", Static).update(DEFAULT_HINT)
 
 
-if __name__ == "__main__":
+def main() -> None:
     import subprocess
     import sys
 
@@ -642,3 +642,7 @@ if __name__ == "__main__":
     result = app.run()
     if result is not None:
         print(result, file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

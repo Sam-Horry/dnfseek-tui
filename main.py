@@ -24,6 +24,7 @@ from textual.widgets._option_list import Option
 CACHE_DIR = Path.home() / ".cache" / "dnfseek"
 INSTALLED_CACHE = CACHE_DIR / "installed"
 AVAILABLE_CACHE = CACHE_DIR / "available"
+UPGRADABLE_CACHE = CACHE_DIR / "upgradable"
 CACHE_MAX_AGE = 24 * 60 * 60
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "dnfseek"
 THEME_FILE = CONFIG_DIR / "theme"
@@ -58,6 +59,7 @@ class DnfseekApp(App):
             self.theme = saved_theme
         self._installed: set[str] = set()
         self._available: set[str] = set()
+        self._upgradable: set[str] = set()
         self._info_cache: dict[str, str] = {}
         self._deps_cache: dict[str, str] = {}
         self._pending_fetches: set[str] = set()
@@ -166,6 +168,15 @@ class DnfseekApp(App):
                 names.append(parts[0])
         return names
 
+    @staticmethod
+    def _parse_repoquery_set(output: str) -> list[str]:
+        names = []
+        for line in output.splitlines():
+            token = line.strip()
+            if token and "." in token and " " not in token:
+                names.append(token)
+        return names
+
     async def _write_cache(self, path: Path, names: list[str]) -> None:
         fd, tmp = tempfile.mkstemp(dir=CACHE_DIR)
         try:
@@ -181,9 +192,11 @@ class DnfseekApp(App):
             self._installed = set(INSTALLED_CACHE.read_text().split())
         if AVAILABLE_CACHE.exists():
             self._available = set(AVAILABLE_CACHE.read_text().split())
+        if UPGRADABLE_CACHE.exists():
+            self._upgradable = set(UPGRADABLE_CACHE.read_text().split())
 
     def _cache_is_stale(self) -> bool:
-        for path in (INSTALLED_CACHE, AVAILABLE_CACHE):
+        for path in (INSTALLED_CACHE, AVAILABLE_CACHE, UPGRADABLE_CACHE):
             if not path.exists():
                 return True
             if time.time() - path.stat().st_mtime > CACHE_MAX_AGE:
@@ -193,11 +206,14 @@ class DnfseekApp(App):
     async def update_cache(self) -> None:
         self.notify("Refreshing package lists...", timeout=2)
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        installed, available = await asyncio.gather(
+        installed, available, upgradable = await asyncio.gather(
             self._dnf_list(["list", "--installed"]),
             self._dnf_list(
                 ["-y", "--setopt=gpgcheck=1", "--setopt=repo_gpgcheck=1",
                  "list", "--available"]
+            ),
+            self._dnf_list(
+                ["repoquery", "--upgrades", "--queryformat", "%{name}.%{arch}"]
             ),
         )
         if installed is None or available is None:
@@ -205,12 +221,16 @@ class DnfseekApp(App):
             return
         installed_names = self._parse_dnf_list(installed)
         available_names = self._parse_dnf_list(available)
+        upgradable_names = self._parse_repoquery_set(upgradable) if upgradable else []
         await asyncio.gather(
             self._write_cache(INSTALLED_CACHE, installed_names),
             self._write_cache(AVAILABLE_CACHE, available_names),
+            self._write_cache(UPGRADABLE_CACHE, upgradable_names),
         )
         self._installed = set(installed_names)
         self._available = set(available_names)
+        self._upgradable = set(upgradable_names)
+        self._populate_options()
         self.notify("Package lists refreshed", severity="information")
 
     async def _ensure_cache(self) -> None:
@@ -243,7 +263,11 @@ class DnfseekApp(App):
             needle = self._filter.casefold()
             names = [name for name in names if needle in name.casefold()]
         options = [
-            Option(f"✅ {name}" if name in self._installed else name, id=name)
+            Option(
+                f"⬆️ {name}" if name in self._upgradable
+                else (f"✅ {name}" if name in self._installed else name),
+                id=name,
+            )
             for name in names
         ]
         left = self.query_one("#left_panel", OptionList)
@@ -298,7 +322,8 @@ class DnfseekApp(App):
             actions = "x Remove | e Reinstall | g Update | d Dependencies"
         else:
             actions = "i Install | d Dependencies"
-        return f"{content}\n\n── Actions ──\n{actions}"
+        suffix = "\n⬆️ Update available" if name in self._upgradable else ""
+        return f"{content}\n\n── Actions ──\n{actions}{suffix}"
 
     def on_option_list_option_selected(
         self, event: OptionList.OptionSelected
@@ -417,6 +442,9 @@ class DnfseekApp(App):
         if name not in self._installed:
             self.notify(f"{name} is not installed", severity="warning")
             return
+        if self._upgradable and name not in self._upgradable:
+            self.notify(f"{name} is already up to date", severity="warning")
+            return
         self.notify(f"Updating {name}...", timeout=2)
         self.run_worker(
             self._run_dnf(
@@ -481,6 +509,7 @@ class DnfseekApp(App):
     def _mark_installed(self, name: str) -> None:
         self._installed.add(name)
         self._available.discard(name)
+        self._upgradable.discard(name)
         self._info_cache.pop(name, None)
         self._deps_cache.pop(name, None)
         self._populate_options()
@@ -495,6 +524,7 @@ class DnfseekApp(App):
     def _mark_removed(self, name: str) -> None:
         self._installed.discard(name)
         self._available.add(name)
+        self._upgradable.discard(name)
         self._info_cache.pop(name, None)
         self._deps_cache.pop(name, None)
         self._populate_options()
@@ -510,6 +540,7 @@ class DnfseekApp(App):
         await asyncio.gather(
             self._write_cache(INSTALLED_CACHE, sorted(self._installed)),
             self._write_cache(AVAILABLE_CACHE, sorted(self._available)),
+            self._write_cache(UPGRADABLE_CACHE, sorted(self._upgradable)),
         )
 
     def _start_upgrade(self) -> None:

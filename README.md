@@ -1,7 +1,7 @@
 # dnfseek
 
 A TUI package browser for Fedora, built with [Textual](https://github.com/Textualize/textual).
-A Python port of the original bash + fzf [`dnfseek`](https://github.com/Sam-Horry/dnfseek) script.
+A Python port of my forked bash + fzf [`dnfseek`](https://github.com/Sam-Horry/dnfseek) script.
 
 ![dnfseek](https://img.shields.io/badge/python-3.12%2B-blue)
 

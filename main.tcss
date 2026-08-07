@@ -11,6 +11,21 @@ Horizontal {
     background: $panel;
     padding: 0 1;
     border: solid $border-blurred;
+    height: 3;
+    align: left middle;
+}
+
+#options_text {
+    width: 1fr;
+}
+
+#spinner {
+    width: 10;
+    height: 1;
+}
+
+.hidden {
+    display: none;
 }
 
 #input {

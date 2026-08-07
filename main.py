@@ -602,15 +602,10 @@ class DnfseekApp(App):
         await process.wait()
         return process.returncode or 0, stderr
 
-    async def _reauthenticate(self) -> bool:
-        """Refresh the sudo timestamp via the password modal."""
-        self._show_status(
-            "Authentication expired - re-enter password (fingerprint also works)"
-        )
-        self._sudo_password = await self.push_screen_wait(PasswordScreen())
-        if not self._sudo_password:
-            self.notify("Action cancelled", severity="warning")
-            return False
+    async def _reauth_sudo(
+        self, password: str | None
+    ) -> tuple[int, list[str], bool]:
+        """Run `sudo -S -v` once; stream stderr to detect the fingerprint phase."""
         process = await asyncio.create_subprocess_exec(
             "sudo", "-S", "-v",
             stdin=asyncio.subprocess.PIPE,
@@ -620,32 +615,45 @@ class DnfseekApp(App):
         assert process.stdin is not None
         assert process.stdout is not None
         assert process.stderr is not None
-        process.stdin.write(f"{self._sudo_password}\n".encode())
-        await process.stdin.drain()
+        if password is not None:
+            process.stdin.write(f"{password}\n".encode())
+            await process.stdin.drain()
         process.stdin.close()
         await process.stdout.read()
-        saw_password_rejected = False
         stderr_lines: list[str] = []
+        fingerprint_seen = False
         async for chunk in process.stderr:
             for line in chunk.decode(errors="replace").splitlines():
                 stderr_lines.append(line)
                 lowered = line.lower()
-                if "sorry, try again" in lowered:
-                    saw_password_rejected = True
-                    self._show_status("Fingerprint not verified - using your password")
-                elif "finger" in lowered:
+                if "finger" in lowered:
+                    fingerprint_seen = True
                     self._show_status("Fingerprint verification in progress...")
-                elif "verification timed out" in lowered:
+                elif "verification timed out" in lowered or "sorry, try again" in lowered:
                     self._show_status("Fingerprint not verified - using your password")
         await process.wait()
-        if process.returncode != 0:
+        return process.returncode or 0, stderr_lines, fingerprint_seen
+
+    async def _reauthenticate(self) -> bool:
+        """Authenticate with sudo: fingerprint first, password as fallback."""
+        self._show_status("Fingerprint verification in progress...")
+        rc, _, _ = await self._reauth_sudo(None)
+        if rc == 0:
+            return True
+        self._show_status("Fingerprint not verified - using your password")
+        self._sudo_password = await self.push_screen_wait(PasswordScreen())
+        if not self._sudo_password:
+            self.notify("Action cancelled", severity="warning")
+            return False
+        rc, stderr_lines, _ = await self._reauth_sudo(self._sudo_password)
+        if rc != 0:
             self._sudo_password = None
             error_lines = stderr_lines[-10:]
             if error_lines:
                 self.query_one("#right_panel", Static).update("\n".join(error_lines))
             self.notify("Authentication failed - please try again", severity="error")
             return False
-        if saw_password_rejected:
+        if any("sorry, try again" in line.lower() for line in stderr_lines):
             self.notify(
                 "Password was rejected, but fingerprint authentication succeeded",
                 severity="warning",

@@ -8,7 +8,7 @@ A Python port of the original bash + fzf [`dnfseek`](https://github.com/Sam-Horr
 ## Prerequisites
 
 - Fedora (or another dnf-based distro)
-- [`uv`](https://docs.astral.sh/uv/) — `sudo dnf install uv`
+- [`uv`](https://docs.astral.sh/uv/) — `curl -LsSf https://astral.sh/uv/install.sh | sh` (recommended)
 
 ## Installation
 

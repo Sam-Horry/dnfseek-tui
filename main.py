@@ -533,6 +533,7 @@ class DnfseekApp(App):
                 or b"no password was provided" in stderr.lower()
             ):
                 if await self._reauthenticate():
+                    self._show_status(self._action_status(args, name))
                     returncode, stderr = await self._sudo_once(args)
                 else:
                     return
@@ -603,7 +604,9 @@ class DnfseekApp(App):
 
     async def _reauthenticate(self) -> bool:
         """Refresh the sudo timestamp via the password modal."""
-        self._show_status("Authentication expired - re-enter password")
+        self._show_status(
+            "Authentication expired - re-enter password (fingerprint also works)"
+        )
         self._sudo_password = await self.push_screen_wait(PasswordScreen())
         if not self._sudo_password:
             self.notify("Action cancelled", severity="warning")
@@ -620,18 +623,33 @@ class DnfseekApp(App):
         process.stdin.write(f"{self._sudo_password}\n".encode())
         await process.stdin.drain()
         process.stdin.close()
-        stderr_task = asyncio.create_task(process.stderr.read())
         await process.stdout.read()
-        stderr = await stderr_task
+        saw_password_rejected = False
+        stderr_lines: list[str] = []
+        async for chunk in process.stderr:
+            for line in chunk.decode(errors="replace").splitlines():
+                stderr_lines.append(line)
+                lowered = line.lower()
+                if "sorry, try again" in lowered:
+                    saw_password_rejected = True
+                    self._show_status("Fingerprint not verified - using your password")
+                elif "finger" in lowered:
+                    self._show_status("Fingerprint verification in progress...")
+                elif "verification timed out" in lowered:
+                    self._show_status("Fingerprint not verified - using your password")
         await process.wait()
         if process.returncode != 0:
             self._sudo_password = None
-            stderr_text = stderr.decode(errors="replace")
-            if stderr_text:
-                error_lines = stderr_text.splitlines()[-10:]
+            error_lines = stderr_lines[-10:]
+            if error_lines:
                 self.query_one("#right_panel", Static).update("\n".join(error_lines))
             self.notify("Authentication failed - please try again", severity="error")
             return False
+        if saw_password_rejected:
+            self.notify(
+                "Password was rejected, but fingerprint authentication succeeded",
+                severity="warning",
+            )
         return True
 
     @staticmethod

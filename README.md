@@ -15,7 +15,7 @@ A Python port of the original bash + fzf [`dnfseek`](https://github.com/Sam-Horr
 ### From git (recommended)
 
 ```bash
-uv tool install --from git+https://github.com/Sam-Horry/dnfseek-tui
+uv tool install git+https://github.com/Sam-Horry/dnfseek-tui
 ```
 
 ### From PyPI
@@ -34,7 +34,7 @@ dnfseek
 ```
 
 | Key | Action |
-|-----|--------|
+| ----- | -------- |
 | `tab` | Switch between search and package list |
 | `u` | Upgrade all packages |
 | `r` | Refresh package cache |

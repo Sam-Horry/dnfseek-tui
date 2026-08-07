@@ -68,6 +68,7 @@ class DnfseekApp(App):
         self._active_package: str | None = None
         self._view_names: list[str] = []
         self._filter = ""
+        self._fingerprint_notice_base: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -629,13 +630,27 @@ class DnfseekApp(App):
                 if "finger" in lowered:
                     fingerprint_seen = True
                     self._show_status("Fingerprint verification in progress...")
+                    if self._fingerprint_notice_base is None:
+                        self._append_right_panel(
+                            "Fingerprint verification required - touch the fingerprint reader"
+                        )
                 elif "verification timed out" in lowered or "sorry, try again" in lowered:
                     self._show_status("Fingerprint not verified - using your password")
+                    self._append_right_panel(
+                        "Fingerprint not verified - using your password"
+                    )
         await process.wait()
         return process.returncode or 0, stderr_lines, fingerprint_seen
 
+    def _append_right_panel(self, message: str) -> None:
+        right_panel = self.query_one("#right_panel", Static)
+        if self._fingerprint_notice_base is None:
+            self._fingerprint_notice_base = right_panel.content
+        right_panel.update(f"{self._fingerprint_notice_base}\n\n{message}")
+
     async def _reauthenticate(self) -> bool:
         """Authenticate with sudo: fingerprint first, password as fallback."""
+        self._fingerprint_notice_base = None
         self._show_status("Fingerprint verification in progress...")
         rc, _, _ = await self._reauth_sudo(None)
         if rc == 0:

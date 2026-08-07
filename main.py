@@ -10,6 +10,7 @@ from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
+from textual.theme import Theme
 from textual.widgets import (
     Input,
     Static,
@@ -24,6 +25,8 @@ CACHE_DIR = Path.home() / ".cache" / "dnfseek"
 INSTALLED_CACHE = CACHE_DIR / "installed"
 AVAILABLE_CACHE = CACHE_DIR / "available"
 CACHE_MAX_AGE = 24 * 60 * 60
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "dnfseek"
+THEME_FILE = CONFIG_DIR / "theme"
 DEFAULT_HINT = "Search for a package, and press TAB to switch focus"
 HIDDEN_SYSTEM_COMMANDS = {"Screenshot", "Maximize", "Minimize"}
 
@@ -51,6 +54,8 @@ class DnfseekApp(App):
 
     def __init__(self) -> None:
         super().__init__()
+        if (saved_theme := self._load_saved_theme()) is not None:
+            self.theme = saved_theme
         self._installed: set[str] = set()
         self._available: set[str] = set()
         self._info_cache: dict[str, str] = {}
@@ -74,6 +79,7 @@ class DnfseekApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        self.theme_changed_signal.subscribe(self, self._save_theme)
         self.styles.scrollbar_visibility = "hidden"
         self.run_worker(
             self._show_packages(installed_only=False),
@@ -82,6 +88,24 @@ class DnfseekApp(App):
             exclusive=True,
             exit_on_error=False,
         )
+
+    def _load_saved_theme(self) -> str | None:
+        if "TEXTUAL_THEME" in os.environ:
+            return None
+        try:
+            saved = THEME_FILE.read_text().strip()
+        except OSError:
+            return None
+        if not saved or self.get_theme(saved) is None:
+            return None
+        return saved
+
+    def _save_theme(self, theme: Theme) -> None:
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            THEME_FILE.write_text(theme.name)
+        except OSError:
+            pass
 
     def get_system_commands(self, screen: Screen) -> Iterable[SystemCommand]:
         # keep built-in commands, minus the ones we don't need

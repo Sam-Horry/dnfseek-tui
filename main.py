@@ -10,13 +10,22 @@ from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen, ModalScreen
-from textual.widgets import Input, Static, Header, Footer, OptionList
+from textual.widgets import (
+    Input,
+    Static,
+    Header,
+    Footer,
+    OptionList,
+    LoadingIndicator,
+)
 from textual.widgets._option_list import Option
 
 CACHE_DIR = Path.home() / ".cache" / "dnfseek"
 INSTALLED_CACHE = CACHE_DIR / "installed"
 AVAILABLE_CACHE = CACHE_DIR / "available"
 CACHE_MAX_AGE = 24 * 60 * 60
+DEFAULT_HINT = "Search for a package, and press TAB to switch focus"
+HIDDEN_SYSTEM_COMMANDS = {"Screenshot", "Maximize", "Minimize"}
 
 
 class PackageList(OptionList):
@@ -62,7 +71,9 @@ class DnfseekApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Static("Search for a package, and press TAB to switch focus", id="options")
+        with Horizontal(id="options"):
+            yield LoadingIndicator(id="spinner", classes="hidden")
+            yield Static(DEFAULT_HINT, id="options_text")
 
         with Horizontal():
             with Vertical():
@@ -82,8 +93,10 @@ class DnfseekApp(App):
         )
 
     def get_system_commands(self, screen: Screen) -> Iterable[SystemCommand]:
-        # keep built-in commands
-        yield from super().get_system_commands(screen)
+        # keep built-in commands, minus the ones we don't need
+        for command in super().get_system_commands(screen):
+            if command.title not in HIDDEN_SYSTEM_COMMANDS:
+                yield command
         # custom commands
         yield SystemCommand(
             "Upgrade all", "Upgrade all packages with dnf", self.upgrade_all
@@ -511,13 +524,90 @@ class DnfseekApp(App):
         installed: str | None = None,
     ) -> None:
         right_panel = self.query_one("#right_panel", Static)
-        if not self._sudo_password:
-            self._sudo_password = await self.push_screen_wait(PasswordScreen())
-            if not self._sudo_password:
-                return
-        right_panel.update(f"Running: {' '.join(args)}")
+        self._show_status(self._action_status(args, name))
+        try:
+            right_panel.update(f"Running: {' '.join(args)}")
+            returncode, stderr = await self._sudo_once(args)
+            if returncode != 0 and (
+                b"a password is required" in stderr.lower()
+                or b"no password was provided" in stderr.lower()
+            ):
+                if await self._reauthenticate():
+                    self._show_status(self._action_status(args, name))
+                    returncode, stderr = await self._sudo_once(args)
+                else:
+                    return
+            if returncode == 0:
+                self.notify(success_msg, timeout=2, severity="information")
+                if installed == "add" and name is not None:
+                    self._mark_installed(name)
+                    self._restore_package_info(name)
+                elif installed == "remove" and name is not None:
+                    self._mark_removed(name)
+                    self._restore_package_info(name)
+                elif name is not None:
+                    self._restore_package_info(name)
+            else:
+                stderr_text = stderr.decode(errors="replace")
+                error_text = stderr_text.lower()
+                if stderr:
+                    error_lines = stderr_text.splitlines()[-10:]
+                    right_panel.update("\n".join(error_lines))
+                if any(
+                    marker in error_text
+                    for marker in (
+                        "sorry, try again",
+                        "incorrect password",
+                        "no password was provided",
+                        "a password is required",
+                    )
+                ):
+                    self._sudo_password = None
+                    self.notify(
+                        "Authentication failed - please try again", severity="error"
+                    )
+                elif "already installed" in error_text:
+                    self.notify(
+                        f"{name or 'Package'} is already installed", severity="warning"
+                    )
+                elif "already the latest" in error_text or "nothing to do" in error_text:
+                    self.notify(
+                        f"{name or 'Packages'} are already up to date",
+                        severity="warning",
+                    )
+                else:
+                    self.notify(
+                        f"Command failed (error code {returncode})",
+                        severity="error",
+                    )
+        finally:
+            self._hide_status()
+
+    async def _sudo_once(self, args: list[str]) -> tuple[int, bytes]:
+        """Run `sudo -n <cmd> ...` once, streaming stdout to the right panel."""
+        right_panel = self.query_one("#right_panel", Static)
         process = await asyncio.create_subprocess_exec(
-            "sudo", "-S", *args,
+            "sudo", "-n", *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stderr_task = asyncio.create_task(process.stderr.read())
+        lines: list[str] = []
+        async for chunk in process.stdout:
+            for line in chunk.decode(errors="replace").replace("\r", "\n").splitlines():
+                if line.strip():
+                    lines.append(line.strip())
+            right_panel.update("\n".join(lines[-15:]))
+        stderr = await stderr_task
+        await process.wait()
+        return process.returncode or 0, stderr
+
+    async def _reauth_sudo(
+        self, password: str | None
+    ) -> tuple[int, list[str], bool]:
+        """Run `sudo -S -v` once; stream stderr to detect the fingerprint phase."""
+        process = await asyncio.create_subprocess_exec(
+            "sudo", "-S", "-v",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -525,54 +615,79 @@ class DnfseekApp(App):
         assert process.stdin is not None
         assert process.stdout is not None
         assert process.stderr is not None
-        process.stdin.write(f"{self._sudo_password}\n".encode())
-        await process.stdin.drain()
+        if password is not None:
+            process.stdin.write(f"{password}\n".encode())
+            await process.stdin.drain()
         process.stdin.close()
-
-        stderr_task = asyncio.create_task(process.stderr.read())
-
-        lines: list[str] = []
-        async for chunk in process.stdout:
-            for line in chunk.decode(errors="replace").replace("\r", "\n").splitlines():
-                if line.strip():
-                    lines.append(line.strip())
-            right_panel.update("\n".join(lines[-15:]))
-
-        stderr = await stderr_task
+        await process.stdout.read()
+        stderr_lines: list[str] = []
+        fingerprint_seen = False
+        async for chunk in process.stderr:
+            for line in chunk.decode(errors="replace").splitlines():
+                stderr_lines.append(line)
+                lowered = line.lower()
+                if "finger" in lowered:
+                    fingerprint_seen = True
+                    self._show_status("Fingerprint verification in progress...")
+                elif "verification timed out" in lowered or "sorry, try again" in lowered:
+                    self._show_status("Fingerprint not verified - using your password")
         await process.wait()
-        if process.returncode == 0:
-            self.notify(success_msg, timeout=2, severity="information")
-            if installed == "add" and name is not None:
-                self._mark_installed(name)
-                self._restore_package_info(name)
-            elif installed == "remove" and name is not None:
-                self._mark_removed(name)
-                self._restore_package_info(name)
-            elif name is not None:
-                self._restore_package_info(name)
-        else:
-            if b"incorrect password" in stderr.lower() or b"Sorry" in stderr:
-                self._sudo_password = None
-            if stderr:
-                error_lines = stderr.decode(errors="replace").splitlines()[-10:]
-                right_panel.update("\n".join(error_lines))
-            error_text = stderr.decode(errors="replace").lower()
-            if "already installed" in error_text:
-                self.notify(
-                    f"{name or 'Package'} is already installed", severity="warning"
-                )
-            elif "already the latest" in error_text or "nothing to do" in error_text:
-                self.notify(
-                    f"{name or 'Packages'} are already up to date",
-                    severity="warning",
-                )
-            else:
-                self.notify(
-                    f"Command failed (error code {process.returncode})",
-                    severity="error",
-                )
+        return process.returncode or 0, stderr_lines, fingerprint_seen
+
+    async def _reauthenticate(self) -> bool:
+        """Authenticate with sudo: fingerprint first, password as fallback."""
+        self._show_status("Fingerprint verification in progress...")
+        rc, _, _ = await self._reauth_sudo(None)
+        if rc == 0:
+            return True
+        self._show_status("Fingerprint not verified - using your password")
+        self._sudo_password = await self.push_screen_wait(PasswordScreen())
+        if not self._sudo_password:
+            self.notify("Action cancelled", severity="warning")
+            return False
+        rc, stderr_lines, _ = await self._reauth_sudo(self._sudo_password)
+        if rc != 0:
+            self._sudo_password = None
+            error_lines = stderr_lines[-10:]
+            if error_lines:
+                self.query_one("#right_panel", Static).update("\n".join(error_lines))
+            self.notify("Authentication failed - please try again", severity="error")
+            return False
+        if any("sorry, try again" in line.lower() for line in stderr_lines):
+            self.notify(
+                "Password was rejected, but fingerprint authentication succeeded",
+                severity="warning",
+            )
+        return True
+
+    @staticmethod
+    def _action_status(args: list[str], name: str | None) -> str:
+        action = args[1]
+        if action == "install":
+            return f"Installing {name}..."
+        if action == "remove":
+            return f"Removing {name}..."
+        if action == "reinstall":
+            return f"Reinstalling {name}..."
+        if action == "upgrade":
+            if name is not None:
+                return f"Upgrading {name}..."
+            return "Upgrading all packages..."
+        return f"Running: {' '.join(args)}"
+
+    def _show_status(self, message: str) -> None:
+        self.query_one("#spinner", LoadingIndicator).remove_class("hidden")
+        self.query_one("#options_text", Static).update(message)
+
+    def _hide_status(self) -> None:
+        self.query_one("#spinner", LoadingIndicator).add_class("hidden")
+        self.query_one("#options_text", Static).update(DEFAULT_HINT)
 
 
 if __name__ == "__main__":
+    import subprocess
+
+    if subprocess.run(["sudo", "-v"]).returncode != 0:
+        raise SystemExit("Authentication failed - dnfseek requires sudo access")
     app = DnfseekApp()
     app.run()

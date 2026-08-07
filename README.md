@@ -15,18 +15,18 @@ A Python port of my forked bash + fzf [`dnfseek`](https://github.com/Sam-Horry/d
 You can test out dnfseek without having to install it, using uvx:
 
 ```bash
-uvx --from git+https://github.com/Sam-Horry/dnfseek-tui dnfseek
+uvx dnfseek
 ```
 
 ## Installation
 
-### From git (recommended)
+### From git
 
 ```bash
 uv tool install git+https://github.com/Sam-Horry/dnfseek-tui
 ```
 
-### From PyPI
+### From PyPI (recommended)
 
 ```bash
 uv tool install dnfseek

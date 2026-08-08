@@ -213,7 +213,7 @@ class DnfseekApp(App):
                  "list", "--available"]
             ),
             self._dnf_list(
-                ["repoquery", "--upgrades", "--queryformat", "%{name}.%{arch}"]
+                ["repoquery", "--upgrades", "--queryformat", "%{name}.%{arch}\n"]
             ),
         )
         if installed is None or available is None:

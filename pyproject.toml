@@ -5,6 +5,7 @@ description = "A TUI package browser for Fedora, built with Textual"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "rapidfuzz>=3.14.5",
     "textual>=8.2.8",
 ]
 

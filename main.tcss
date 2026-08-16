@@ -44,6 +44,7 @@ Horizontal {
     background: $panel;
     border: solid $border-blurred;
     padding: 0 1;
+    text-wrap: nowrap;
     /*margin: 0 0 1 0;*/
 }
 #left_panel:focus-within {

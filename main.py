@@ -1,3 +1,16 @@
+"""dnfseek — a Textual TUI wrapper for dnf on Fedora.
+
+The whole app lives in this module: a single ``DnfseekApp`` (plus a thin
+``PackageList`` subclass). The companion stylesheet ``main.tcss`` is loaded
+via ``App.CSS_PATH`` and styles widgets by their ids (``#options``,
+``#input``, ``#left_panel``, ``#right_panel``, ``#spinner``); those ids are
+the cross-references noted throughout the comments below.
+
+Run with ``uv run main.py`` (or the installed ``dnfseek`` console script).
+A ``sudo -v`` gate runs before the TUI starts (see ``main()``); package
+actions later call ``sudo -n``, with no in-app reauthentication.
+"""
+
 import asyncio
 import os
 import re
@@ -19,30 +32,64 @@ from textual.widgets import (
     OptionList,
     LoadingIndicator,
 )
+# ``Option`` is NOT exported from ``textual.widgets`` in textual 8.2.8, so it
+# must be imported from the private ``_option_list`` module. Used to build the
+# entries of the virtualized left-panel list (see ``_populate_options``).
 from textual.widgets._option_list import Option
 
+# On-disk cache of package names, one ``name.arch`` per line. Refreshed from
+# ``dnf`` when missing or older than ``CACHE_MAX_AGE`` (see ``update_cache``);
+# a fresh cache is read instantly with no subprocess spawn (``_load_cache``).
 CACHE_DIR = Path.home() / ".cache" / "dnfseek"
 INSTALLED_CACHE = CACHE_DIR / "installed"
 AVAILABLE_CACHE = CACHE_DIR / "available"
 UPGRADABLE_CACHE = CACHE_DIR / "upgradable"
-CACHE_MAX_AGE = 24 * 60 * 60
+CACHE_MAX_AGE = 24 * 60 * 60  # 24h, the same freshness threshold as the bash original.
+
+# Persisted selection from the command-palette Theme command; ignored if
+# ``TEXTUAL_THEME`` is set in the environment (see ``_load_saved_theme``).
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "dnfseek"
 THEME_FILE = CONFIG_DIR / "theme"
+
+# Status-bar text shown when no action is running (rendered in ``#options_text``).
 DEFAULT_HINT = "Search for a package, and press TAB to switch focus"
+
+# Built-in command-palette entries hidden from the palette (see
+# ``get_system_commands``); Theme/Quit/Keys still appear.
 HIDDEN_SYSTEM_COMMANDS = {"Screenshot", "Maximize", "Minimize"}
 
 
 class PackageList(OptionList):
+    """Left-panel package list.
+
+    Subclassed only to bind ``space`` to select (triggering the info preview);
+    the OptionList itself is virtualized so the ~78k available-package cache
+    renders smoothly. (Option selection is what drives the info preview in
+    ``on_option_list_option_selected``.)
+    """
+
     BINDINGS = [
         Binding("space", "select", "Select", show=False),
     ]
 
 
 class DnfseekApp(App):
+    """The whole dnfseek TUI: search/browse packages and run dnf actions.
+
+    Layout (ids match ``main.tcss`` rules):
+      * ``#options`` — status bar with a hidden ``#spinner`` (``.hidden`` in
+        ``main.tcss`` sets ``display: none``) and ``#options_text``.
+      * ``#input`` — client-side filter over the in-memory list.
+      * ``#left_panel`` — this ``PackageList`` (virtualized OptionList).
+      * ``#right_panel`` — info/deps/output preview ``Static``.
+    """
+
     CSS_PATH = "main.tcss"
     TITLE = "dnfseek"
     SUB_TITLE = "a TUI dnf wrapper"
 
+    # Key → action_* method (textual convention). Listed in the Footer and in
+    # the command palette (see ``get_system_commands``).
     BINDINGS = [
         ("u", "upgrade_all", "Upgrade all packages"),
         ("r", "refresh_cache", "Refresh cache"),
@@ -57,20 +104,29 @@ class DnfseekApp(App):
         super().__init__()
         if (saved_theme := self._load_saved_theme()) is not None:
             self.theme = saved_theme
+        # Package-name sets (one ``name.arch`` per entry). Populated from the
+        # on-disk cache (``_load_cache``) and refreshed via ``update_cache``.
         self._installed: set[str] = set()
         self._available: set[str] = set()
         self._upgradable: set[str] = set()
+        # Per-package in-memory caches of lazy-fetched dnf output.
         self._info_cache: dict[str, str] = {}
         self._deps_cache: dict[str, str] = {}
+        # Names with a fetch worker already in flight; prevents duplicate
+        # ``dnf info`` / deps spawns when the user re-selects quickly.
         self._pending_fetches: set[str] = set()
+        # Currently-selected package (whose info is shown in ``#right_panel``).
         self._active_package: str | None = None
+        # Names backing the current view (installed-only OR installed|available),
+        # before the live ``#input`` filter is applied (see ``_populate_options``).
         self._view_names: list[str] = []
         self._filter = ""
 
     def compose(self) -> ComposeResult:
+        """Build the widget tree. Widget ids are targeted by ``main.tcss``."""
         yield Header()
-        with Horizontal(id="options"):
-            yield LoadingIndicator(id="spinner", classes="hidden")
+        with Horizontal(id="options"):  # styled by the ``#options`` rule (height: 3)
+            yield LoadingIndicator(id="spinner", classes="hidden")  # toggled by ``_show_status``/``_hide_status``
             yield Static(DEFAULT_HINT, id="options_text")
 
         with Horizontal():
@@ -81,8 +137,11 @@ class DnfseekApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        """Boot straight into "Search all" so the list is never blank."""
         self.theme_changed_signal.subscribe(self, self._save_theme)
         self.styles.scrollbar_visibility = "hidden"
+        # Runs ``_show_packages(installed_only=False)`` in a worker; the
+        # ``exclusive=True`` group cancels any prior search worker mid-flight.
         self.run_worker(
             self._show_packages(installed_only=False),
             name="search-all",
@@ -92,6 +151,11 @@ class DnfseekApp(App):
         )
 
     def _load_saved_theme(self) -> str | None:
+        """Return the persisted theme name, or None to fall back to defaults.
+
+        The ``TEXTUAL_THEME`` env var takes precedence (we then stay hands-off);
+        missing/empty file or unknown theme name also yield None.
+        """
         if "TEXTUAL_THEME" in os.environ:
             return None
         try:
@@ -103,6 +167,7 @@ class DnfseekApp(App):
         return saved
 
     def _save_theme(self, theme: Theme) -> None:
+        """Persist theme name on change (best-effort: silent on OSError)."""
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             THEME_FILE.write_text(theme.name)
@@ -110,6 +175,12 @@ class DnfseekApp(App):
             pass
 
     def get_system_commands(self, screen: Screen) -> Iterable[SystemCommand]:
+        """Populate the command palette (ctrl+p).
+
+        Filters the built-in commands via ``HIDDEN_SYSTEM_COMMANDS`` (note the
+        display-name field is ``command.title``, not ``.name`` — SystemCommand
+        is a NamedTuple), then appends the dnfseek actions.
+        """
         # keep built-in commands, minus the ones we don't need
         for command in super().get_system_commands(screen):
             if command.title not in HIDDEN_SYSTEM_COMMANDS:
@@ -149,6 +220,11 @@ class DnfseekApp(App):
         )
 
     async def _dnf_list(self, args: list[str]) -> str | None:
+        """Run an unprivileged ``dnf -q`` and return its stdout, or None on failure.
+
+        Used to populate the cache (installed/available/upgradable). stdout/stderr
+        are always PIPed — children must never write to the TUI terminal.
+        """
         process = await asyncio.create_subprocess_exec(
             "dnf", "-q", *args,
             stdout=asyncio.subprocess.PIPE,
@@ -161,6 +237,13 @@ class DnfseekApp(App):
 
     @staticmethod
     def _parse_dnf_list(output: str) -> list[str]:
+        """Extract package names from ``dnf list`` output.
+
+        Each data row is ``<name>.<arch>  <version>  <repo>``. The
+        ``re.search(r"[0-9.-]", parts[1])`` check discriminates real data rows
+        (whose 2nd field is a version with digits/dots/dashes) from the two
+        header rows ``Installed Packages`` / ``Available Packages``.
+        """
         names = []
         for line in output.splitlines():
             parts = line.split()
@@ -170,6 +253,11 @@ class DnfseekApp(App):
 
     @staticmethod
     def _parse_repoquery_set(output: str) -> list[str]:
+        """Extract ``name.arch`` tokens from ``dnf repoquery`` output.
+
+        Keeps only single tokens containing a ``.`` (arch separator) — this
+        discards empty lines and any unexpected multi-word rows.
+        """
         names = []
         for line in output.splitlines():
             token = line.strip()
@@ -178,6 +266,11 @@ class DnfseekApp(App):
         return names
 
     async def _write_cache(self, path: Path, names: list[str]) -> None:
+        """Atomically write the cache file: mkstemp → os.replace.
+
+        Writing to a temp file in ``CACHE_DIR`` and renaming avoids a
+        half-written cache being read by a concurrent ``_load_cache``.
+        """
         fd, tmp = tempfile.mkstemp(dir=CACHE_DIR)
         try:
             with os.fdopen(fd, "w") as f:
@@ -188,6 +281,7 @@ class DnfseekApp(App):
             os.unlink(tmp)
 
     def _load_cache(self) -> None:
+        """Read any existing cache files into the in-memory sets (instant)."""
         if INSTALLED_CACHE.exists():
             self._installed = set(INSTALLED_CACHE.read_text().split())
         if AVAILABLE_CACHE.exists():
@@ -196,6 +290,7 @@ class DnfseekApp(App):
             self._upgradable = set(UPGRADABLE_CACHE.read_text().split())
 
     def _cache_is_stale(self) -> bool:
+        """True if any cache file is missing or older than ``CACHE_MAX_AGE``."""
         for path in (INSTALLED_CACHE, AVAILABLE_CACHE, UPGRADABLE_CACHE):
             if not path.exists():
                 return True
@@ -204,6 +299,14 @@ class DnfseekApp(App):
         return False
 
     async def update_cache(self) -> None:
+        """Refresh all three cache files from dnf and repopulate the list.
+
+        Runs the three fetches concurrently with ``asyncio.gather``. The
+        available-list fetch carries ``--setopt=gpgcheck=1 --setopt=repo_gpgcheck=1``
+        (mirrors a plain ``dnf install``). Upgradable names come from
+        ``dnf repoquery --upgrades`` (parsed by ``_parse_repoquery_set``) rather
+        than a separate ``dnf list``, giving a clean ``name.arch`` set directly.
+        """
         self.notify("Refreshing package lists...", timeout=2)
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         installed, available, upgradable = await asyncio.gather(
@@ -234,12 +337,14 @@ class DnfseekApp(App):
         self.notify("Package lists refreshed", severity="information")
 
     async def _ensure_cache(self) -> None:
+        """Load the disk cache if needed, then refresh if it's stale."""
         if not self._installed and not self._available:
             self._load_cache()
         if self._cache_is_stale():
             await self.update_cache()
 
     async def refresh_cache(self) -> None:
+        """Command-palette entry point for "Refresh cache"."""
         self.run_worker(
             self.update_cache(),
             name="refresh-cache",
@@ -249,6 +354,7 @@ class DnfseekApp(App):
         )
 
     def action_refresh_cache(self) -> None:
+        """``r`` key handler — same worker as the palette entry."""
         self.run_worker(
             self.update_cache(),
             name="refresh-cache",
@@ -258,6 +364,13 @@ class DnfseekApp(App):
         )
 
     def _populate_options(self) -> None:
+        """Rebuild ``#left_panel`` from ``_view_names`` + the live filter.
+
+        Filtering is purely client-side (casefold substring) over the in-memory
+        list, so no dnf call and no debounce is needed on ``on_input_changed``.
+        Glyph precedence is ⬆️ (upgradable) over ✅ (installed) — a package can
+        be both installed and have an upgrade available.
+        """
         names = self._view_names
         if self._filter:
             needle = self._filter.casefold()
@@ -277,6 +390,7 @@ class DnfseekApp(App):
             left.highlighted = 0
 
     async def search_all(self) -> None:
+        """Command-palette "Search all" — installed | available."""
         self.run_worker(
             self._show_packages(installed_only=False),
             name="search-all",
@@ -286,6 +400,7 @@ class DnfseekApp(App):
         )
 
     async def search_installed(self) -> None:
+        """Command-palette "Search installed" — installed only."""
         self.run_worker(
             self._show_packages(installed_only=True),
             name="show-installed",
@@ -295,6 +410,7 @@ class DnfseekApp(App):
         )
 
     async def _show_packages(self, installed_only: bool) -> None:
+        """Ensure cache freshness, set the view's names, reset the filter, render."""
         await self._ensure_cache()
         if installed_only:
             names = sorted(self._installed)
@@ -306,6 +422,11 @@ class DnfseekApp(App):
         self._populate_options()
 
     def on_input_changed(self, event: Input.Changed) -> None:
+        """Client-side filter handler for ``#input``.
+
+        The ``event.value == self._filter`` guard skips redundant re-renders:
+        textual re-emits Changed on focus even when the value didn't change.
+        """
         if event.input.id != "input":
             return
         if event.value == self._filter:
@@ -314,10 +435,16 @@ class DnfseekApp(App):
         self._populate_options()
 
     def _selected_package(self) -> str | None:
+        """Return the highlighted package's id (its ``name.arch``), or None."""
         option = self.query_one("#left_panel", OptionList).highlighted_option
         return option.id if option is not None else None
 
     def _format_info(self, name: str, content: str) -> str:
+        """Append the contextual Actions footer to a block of info/deps text.
+
+        The footer varies by installed state and gains a ⬆️ line when an
+        upgrade is available. (Footer will be replaced by tab labels per PLAN.md.)
+        """
         if name in self._installed:
             actions = "x Remove | e Reinstall | g Update | d Dependencies"
         else:
@@ -328,6 +455,12 @@ class DnfseekApp(App):
     def on_option_list_option_selected(
         self, event: OptionList.OptionSelected
     ) -> None:
+        """Show info for the selected package in ``#right_panel`` (lazy + cached).
+
+        Cache hit → instant render. In-flight fetch → no-op until the worker
+        resolves and updates the panel. Otherwise kick a worker via
+        ``_fetch_package_info`` and mark the name as pending.
+        """
         name = event.option_id
         if name is None:
             return
@@ -348,6 +481,14 @@ class DnfseekApp(App):
         )
 
     async def _fetch_package_info(self, name: str) -> None:
+        """Lazy ``dnf info`` → ``_info_cache``, rendered only if still active.
+
+        ``dnf info`` is unprivileged (no sudo). We filter to 7 keys
+        (Name/Summary/Version/Release/Size/URL/Description) rather than render
+        the full output — see PLAN.md bundle 3 for the proposed full-output tab.
+        The ``name == self._active_package`` guard avoids clobbering the panel
+        if the user selected a different package while this fetch ran.
+        """
         process = await asyncio.create_subprocess_exec(
             "dnf", "info", name,
             stdout=asyncio.subprocess.PIPE,
@@ -370,6 +511,14 @@ class DnfseekApp(App):
             )
 
     def action_install(self) -> None:
+        """``i`` — install the highlighted package via ``dnf install``.
+
+        The four package actions share a shape: guard (no selection / wrong
+        state) → notify → spawn ``_run_dnf`` in a ``group="dnf"`` exclusive
+        worker. ``installed="add"|"remove"|None`` tells ``_run_dnf`` which
+        ``_mark_*`` helper to run on success so the in-memory + disk caches
+        stay consistent.
+        """
         name = self._selected_package()
         if name is None:
             self.notify("No package selected", severity="warning")
@@ -392,6 +541,7 @@ class DnfseekApp(App):
         )
 
     def action_remove(self) -> None:
+        """``x`` — remove an installed package via ``dnf remove``."""
         name = self._selected_package()
         if name is None:
             self.notify("No package selected", severity="warning")
@@ -414,6 +564,7 @@ class DnfseekApp(App):
         )
 
     def action_reinstall(self) -> None:
+        """``e`` — reinstall an installed package (no cache-set change → installed=None)."""
         name = self._selected_package()
         if name is None:
             self.notify("No package selected", severity="warning")
@@ -435,6 +586,12 @@ class DnfseekApp(App):
         )
 
     def action_update_package(self) -> None:
+        """``g`` — upgrade one installed package via ``dnf upgrade``.
+
+        Guards on ``self._upgradable`` (loaded by ``update_cache``) to refuse
+        packages with no pending upgrade. ``_upgradable`` may be empty if the
+        cache wasn't refreshed yet, in which case the guard is skipped.
+        """
         name = self._selected_package()
         if name is None:
             self.notify("No package selected", severity="warning")
@@ -459,6 +616,12 @@ class DnfseekApp(App):
         )
 
     def action_deps(self) -> None:
+        """``d`` — show ``dnf repoquery --requires`` for the highlighted package.
+
+        Cache-first into ``_deps_cache``; otherwise spawn ``_fetch_deps`` in
+        the ``"info"`` worker group. Output is rendered through
+        ``_format_info`` to reuse the Actions footer.
+        """
         name = self._selected_package()
         if name is None:
             self.notify("No package selected", severity="warning")
@@ -476,6 +639,7 @@ class DnfseekApp(App):
         )
 
     async def _fetch_deps(self, name: str) -> None:
+        """Fetch and cache a package's requirements (unprivileged repoquery)."""
         process = await asyncio.create_subprocess_exec(
             "dnf", "repoquery", "--requires", name,
             stdout=asyncio.subprocess.PIPE,
@@ -493,6 +657,11 @@ class DnfseekApp(App):
         right_panel.update(self._format_info(name, text))
 
     def _restore_package_info(self, name: str) -> None:
+        """Re-show info for a package after a dnf action mutated state.
+
+        Cache hit → render immediately; otherwise kick a fresh ``dnf info``
+        fetch (the cached entry was just invalidated by ``_mark_*``).
+        """
         self._active_package = name
         if name in self._info_cache:
             self.query_one("#right_panel", Static).update(
@@ -507,6 +676,11 @@ class DnfseekApp(App):
             )
 
     def _mark_installed(self, name: str) -> None:
+        """Move ``name`` from available→installed, drop stale caches, persist.
+
+        Also drops the entry from ``_upgradable`` (a just-installed package is
+        current by definition) and re-syncs all three disk caches in a worker.
+        """
         self._installed.add(name)
         self._available.discard(name)
         self._upgradable.discard(name)
@@ -522,6 +696,7 @@ class DnfseekApp(App):
         )
 
     def _mark_removed(self, name: str) -> None:
+        """Move ``name`` from installed→available; mirror ``_mark_installed``."""
         self._installed.discard(name)
         self._available.add(name)
         self._upgradable.discard(name)
@@ -537,6 +712,7 @@ class DnfseekApp(App):
         )
 
     async def _sync_cache_files(self) -> None:
+        """Rewrite all three cache files from the current in-memory sets."""
         await asyncio.gather(
             self._write_cache(INSTALLED_CACHE, sorted(self._installed)),
             self._write_cache(AVAILABLE_CACHE, sorted(self._available)),
@@ -544,6 +720,7 @@ class DnfseekApp(App):
         )
 
     def _start_upgrade(self) -> None:
+        """Shared body of upgrade_all / action_upgrade_all — kicks ``dnf upgrade -y``."""
         self.notify("Upgrading all packages...", timeout=2)
         self.run_worker(
             self._run_dnf(
@@ -557,9 +734,11 @@ class DnfseekApp(App):
         )
 
     async def upgrade_all(self) -> None:
+        """Command-palette "Upgrade all" (routes through ``_start_upgrade``)."""
         self._start_upgrade()
 
     def action_upgrade_all(self) -> None:
+        """``u`` key handler (routes through ``_start_upgrade``)."""
         self._start_upgrade()
 
     async def _run_dnf(
@@ -569,6 +748,19 @@ class DnfseekApp(App):
         name: str | None = None,
         installed: str | None = None,
     ) -> None:
+        """Drive a privileged dnf action end-to-end: status → sudo → result.
+
+        Three branches after ``_sudo_once`` returns:
+          * sudo expired (``sudo -n`` reports "a password is required" /
+            "no password was provided") → notify + ``self.exit(result=...)``,
+            which ``main()`` prints to stderr after the TUI restores the
+            terminal. There is no in-app reauth path.
+          * returncode 0 → notify success, apply the cache-set mutation
+            (``installed="add"|"remove"``), refresh the panel.
+          * non-zero → surface the last 10 stderr lines in ``#right_panel``
+            and classify the common dnf messages (already installed /
+            already latest / nothing-to-do) into friendlier notifications.
+        """
         right_panel = self.query_one("#right_panel", Static)
         self._show_status(self._action_status(args, name))
         try:
@@ -621,7 +813,18 @@ class DnfseekApp(App):
             self._hide_status()
 
     async def _sudo_once(self, args: list[str]) -> tuple[int, bytes]:
-        """Run `sudo -n <cmd> ...` once, streaming stdout to the right panel."""
+        """Run ``sudo -n <cmd> ...`` once, streaming stdout to ``#right_panel``.
+
+        Non-interactive sudo (validated up front by ``main()``'s ``sudo -v``).
+        stdout is streamed line-by-line into the panel showing only the last
+        15 lines (a scrollback-preserving RichLog is planned per PLAN.md).
+        stderr is read in parallel (``stderr_task``) so stderr buffering can't
+        deadlock the streaming stdout. ``--requires``-style messages are
+        matched case-insensitively against the raw **bytes** (``stderr.lower()``)
+        rather than decoded text, which is why the literals are byte strings.
+        Returns ``(returncode, stderr_bytes)``; ``returncode or 0`` coerces the
+        ``None`` that ``create_subprocess_exec`` can leave behind before wait().
+        """
         right_panel = self.query_one("#right_panel", Static)
         process = await asyncio.create_subprocess_exec(
             "sudo", "-n", *args,
@@ -641,6 +844,7 @@ class DnfseekApp(App):
 
     @staticmethod
     def _action_status(args: list[str], name: str | None) -> str:
+        """Map a dnf argv to the status-bar message shown during the run."""
         action = args[1]
         if action == "install":
             return f"Installing {name}..."
@@ -655,15 +859,25 @@ class DnfseekApp(App):
         return f"Running: {' '.join(args)}"
 
     def _show_status(self, message: str) -> None:
+        """Un-hide ``#spinner`` (the ``.hidden`` rule in main.tcss sets display:none) and set ``#options_text``."""
         self.query_one("#spinner", LoadingIndicator).remove_class("hidden")
         self.query_one("#options_text", Static).update(message)
 
     def _hide_status(self) -> None:
+        """Re-hide ``#spinner`` and restore ``#options_text`` to ``DEFAULT_HINT``."""
         self.query_one("#spinner", LoadingIndicator).add_class("hidden")
         self.query_one("#options_text", Static).update(DEFAULT_HINT)
 
 
 def main() -> None:
+    """Entry point — authenticate, run the TUI, print any exit result.
+
+    ``sudo -v`` runs on the *real terminal* before the TUI starts (the wrong
+    password, or a fingerprint tap, is handled here — the app itself never
+    holds a password). If ``app.run()`` returns a string — i.e. a
+    ``self.exit(result=<message>)`` such as the sudo-expiry path — it is
+    printed to stderr after the TUI restores the terminal.
+    """
     import subprocess
     import sys
 

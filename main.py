@@ -26,6 +26,7 @@ from rapidfuzz.distance import Indel
 from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.geometry import Size
 from textual.screen import Screen
 from textual.theme import Theme
 from textual.timer import Timer
@@ -68,19 +69,34 @@ HIDDEN_SYSTEM_COMMANDS = {"Screenshot", "Maximize", "Minimize"}
 MAX_RESULTS = 500
 FILTER_DEBOUNCE = 0.06  # seconds of quiet before the list is re-filtered
 
+# Lazy full-list loading: above ``LAZY_THRESHOLD`` options (only ever the
+# unfiltered full view — filtered results are capped at ``MAX_RESULTS``),
+# ``_populate_options`` shows the first ``LAZY_CHUNK`` immediately and
+# streams the rest in a background worker so the UI never blocks on the
+# ~1s cold rebuild of 78k options.
+LAZY_THRESHOLD = 2000
+LAZY_CHUNK = 2000
+LAZY_PAUSE = 0.01  # seconds between chunks (let the screen paint)
+
 
 class PackageList(OptionList):
     """Left-panel package list.
 
-    Subclassed only to bind ``space`` to select (triggering the info preview);
-    the OptionList itself is virtualized so the ~78k available-package cache
-    renders smoothly. (Option selection is what drives the info preview in
-    ``on_option_list_option_selected``.)
+    Subclassed to bind ``space`` to select (triggering the info preview) and
+    to make ``get_content_height`` O(1): every option is a single line (a
+    package name, never wrapped, no divider rows), so the content height is
+    just the option count. The base implementation sums per-option heights on
+    every layout pass — quadratic-ish at ~78k options, which showed up in
+    profiling as a multi-second stall per rebuild. (Option selection is what
+    drives the info preview in ``on_option_list_option_selected``.)
     """
 
     BINDINGS = [
         Binding("space", "select", "Select", show=False),
     ]
+
+    def get_content_height(self, container: Size, viewport: Size, width: int) -> int:
+        return self.option_count
 
 
 class DnfseekApp(App):
@@ -141,6 +157,9 @@ class DnfseekApp(App):
         # True while a dnf action's status owns ``#options_text`` — keeps
         # ``_populate_options``'s match-count hint from clobbering it.
         self._status_active = False
+        # Bumped on every ``_populate_options``; a lazy full-list stream aborts
+        # when its captured generation goes stale (see ``_populate_options_lazy``).
+        self._populate_generation = 0
 
     def compose(self) -> ComposeResult:
         """Build the widget tree. Widget ids are targeted by ``main.tcss``."""
@@ -152,7 +171,7 @@ class DnfseekApp(App):
         with Horizontal():
             with Vertical():
                 yield Input(placeholder="Type Package Name", id="input")
-                yield PackageList(id="left_panel")
+                yield PackageList(id="left_panel", markup=False)
             yield Static("Select a package (enter/space) to view its information", id="right_panel", markup=False)
         yield Footer()
 
@@ -477,10 +496,16 @@ class DnfseekApp(App):
 
         Ranking is purely client-side fuzzy matching (``_match_names``) over the
         in-memory list — no dnf calls — capped at ``MAX_RESULTS`` so the
-        OptionList rebuild stays cheap. Glyph precedence is ⬆️ (upgradable)
-        over ✅ (installed) — a package can be both installed and have an
-        upgrade available. When filtered, ``#options_text`` shows a match-count
-        hint unless a dnf action's status owns it (``_status_active``).
+        per-keystroke OptionList rebuild stays cheap. Glyph precedence is ⬆️
+        (upgradable) over ✅ (installed) — a package can be both installed and
+        have an upgrade available. When filtered, ``#options_text`` shows a
+        match-count hint unless a dnf action's status owns it
+        (``_status_active``).
+
+        Oversized result sets (the unfiltered full view) are lazy: the first
+        ``LAZY_CHUNK`` renders synchronously, the rest streams in via
+        ``_populate_options_lazy``. Every call bumps ``_populate_generation``,
+        which aborts any stream still in flight.
         """
         names, match_count = self._match_names(self._filter)
         options = [
@@ -491,10 +516,22 @@ class DnfseekApp(App):
             )
             for name in names
         ]
+        self._populate_generation += 1
         left = self.query_one("#left_panel", OptionList)
-        left.set_options(options)
-        if options:
+        if len(options) > LAZY_THRESHOLD:
+            left.set_options(options[:LAZY_CHUNK])
             left.highlighted = 0
+            self.run_worker(
+                self._populate_options_lazy(options, self._populate_generation),
+                name="populate",
+                group="populate",
+                exclusive=True,
+                exit_on_error=False,
+            )
+        else:
+            left.set_options(options)
+            if options:
+                left.highlighted = 0
         if not self._status_active:
             hint = DEFAULT_HINT
             if self._filter:
@@ -508,6 +545,27 @@ class DnfseekApp(App):
                 else:
                     hint = f"{len(names)} matches"
             self.query_one("#options_text", Static).update(hint)
+
+    async def _populate_options_lazy(
+        self, options: list[Option], generation: int
+    ) -> None:
+        """Stream the full view into ``#left_panel`` in background chunks.
+
+        The first ``LAZY_CHUNK`` was already set by ``_populate_options``;
+        this appends the rest ``LAZY_CHUNK`` at a time, pausing between chunks
+        so the screen paints. A stale ``generation`` (any newer
+        ``_populate_options`` — a keystroke filter, view switch, or cache
+        refresh) aborts the stream; that newer populate has already replaced
+        the list.
+        """
+        left = self.query_one("#left_panel", OptionList)
+        for start in range(LAZY_CHUNK, len(options), LAZY_CHUNK):
+            if generation != self._populate_generation:
+                return
+            await asyncio.sleep(LAZY_PAUSE)
+            if generation != self._populate_generation:
+                return
+            left.add_options(options[start:start + LAZY_CHUNK])
 
     async def search_all(self) -> None:
         """Command-palette "Search all" — installed | available."""

@@ -12,6 +12,7 @@ actions later call ``sudo -n``, with no in-app reauthentication.
 """
 
 import asyncio
+import heapq
 import os
 import re
 import tempfile
@@ -19,11 +20,15 @@ import time
 from pathlib import Path
 from typing import Iterable
 
+from rapidfuzz import process
+from rapidfuzz.distance import Indel
+
 from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.theme import Theme
+from textual.timer import Timer
 from textual.widgets import (
     Input,
     Static,
@@ -57,6 +62,11 @@ DEFAULT_HINT = "Search for a package, and press TAB to switch focus"
 # Built-in command-palette entries hidden from the palette (see
 # ``get_system_commands``); Theme/Quit/Keys still appear.
 HIDDEN_SYSTEM_COMMANDS = {"Screenshot", "Maximize", "Minimize"}
+
+# Fuzzy-search tuning: cap displayed matches so the per-keystroke OptionList
+# rebuild stays cheap (~50ms), and debounce rapid typing before re-ranking.
+MAX_RESULTS = 500
+FILTER_DEBOUNCE = 0.06  # seconds of quiet before the list is re-filtered
 
 
 class PackageList(OptionList):
@@ -120,7 +130,17 @@ class DnfseekApp(App):
         # Names backing the current view (installed-only OR installed|available),
         # before the live ``#input`` filter is applied (see ``_populate_options``).
         self._view_names: list[str] = []
+        # Casefolded twin of ``_view_names``, built once per view change in
+        # ``_rebuild_view_names`` — the per-keystroke fuzzy ranker never casefolds.
+        self._view_cf: list[str] = []
+        # The view mode last requested (see ``_rebuild_view_names``).
+        self._installed_only = False
         self._filter = ""
+        # Pending debounce timer for ``on_input_changed`` re-ranking.
+        self._filter_timer: Timer | None = None
+        # True while a dnf action's status owns ``#options_text`` — keeps
+        # ``_populate_options``'s match-count hint from clobbering it.
+        self._status_active = False
 
     def compose(self) -> ComposeResult:
         """Build the widget tree. Widget ids are targeted by ``main.tcss``."""
@@ -333,6 +353,7 @@ class DnfseekApp(App):
         self._installed = set(installed_names)
         self._available = set(available_names)
         self._upgradable = set(upgradable_names)
+        self._rebuild_view_names(self._installed_only)
         self._populate_options()
         self.notify("Package lists refreshed", severity="information")
 
@@ -363,18 +384,105 @@ class DnfseekApp(App):
             exit_on_error=False,
         )
 
-    def _populate_options(self) -> None:
-        """Rebuild ``#left_panel`` from ``_view_names`` + the live filter.
-
-        Filtering is purely client-side (casefold substring) over the in-memory
-        list, so no dnf call and no debounce is needed on ``on_input_changed``.
-        Glyph precedence is ⬆️ (upgradable) over ✅ (installed) — a package can
-        be both installed and have an upgrade available.
+    def _rebuild_view_names(self, installed_only: bool) -> None:
+        """Set ``_view_names`` (and its casefolded twin ``_view_cf``) from the
+        current package sets. Called on view switches and after install/remove
+        mutations so the ranked list always reflects ``_installed``/``_available``.
         """
-        names = self._view_names
-        if self._filter:
-            needle = self._filter.casefold()
-            names = [name for name in names if needle in name.casefold()]
+        self._installed_only = installed_only
+        names = (
+            sorted(self._installed)
+            if installed_only
+            else sorted(self._installed | self._available)
+        )
+        self._view_names = names
+        self._view_cf = [name.casefold() for name in names]
+
+    def _match_names(self, query: str) -> tuple[list[str], int]:
+        """Rank ``_view_names`` against ``query``, best first, capped at ``MAX_RESULTS``.
+
+        Case-insensitive, over the precomputed ``_view_cf`` (no per-keystroke
+        casefolding). Matches are tiered fzf-style: prefix matches first, then
+        word-boundary matches (previous char not alphanumeric), then plain
+        substrings; within a tier, shorter names win (alphabetical tiebreak),
+        with a bonus when the match ends on a boundary — so "zlib" ranks
+        ``zlib-ng`` above ``zlibrary``. When the tiers exhaust the budget,
+        the remainder is filled with fuzzy subsequence matches (rapidfuzz
+        Indel/LCS scorer, then verified to actually contain the query in
+        order), so out-of-order queries like "frefx" still surface
+        ``firefox``.
+
+        Returns ``(names, match_count)`` — the substring-match count drives
+        the "top N of M" status hint and can exceed ``len(names)`` when capped.
+        """
+        if not query:
+            return self._view_names, len(self._view_names)
+        needle = query.casefold()
+        names, candidates = self._view_names, self._view_cf
+        prefix, boundary, substring = [], [], []
+        for i, candidate in enumerate(candidates):
+            pos = candidate.find(needle)
+            if pos < 0:
+                continue
+            if pos == 0:
+                prefix.append(i)
+            elif not candidate[pos - 1].isalnum():
+                boundary.append(i)
+            else:
+                substring.append(i)
+        match_count = len(prefix) + len(boundary) + len(substring)
+
+        def prefix_key(i: int) -> tuple[int, int, str]:
+            rest = candidates[i][len(needle):]
+            ends_on_boundary = not rest or not rest[0].isalnum()
+            return (0 if ends_on_boundary else 1, len(candidates[i]), candidates[i])
+
+        def tier_key(i: int) -> tuple[int, str]:
+            return (len(candidates[i]), candidates[i])
+
+        matched: list[int] = []
+        budget = MAX_RESULTS
+        for tier, key in ((prefix, prefix_key), (boundary, tier_key), (substring, tier_key)):
+            if not tier or not budget:
+                continue
+            take = heapq.nsmallest(budget, tier, key=key)
+            matched.extend(take)
+            budget -= len(take)
+        if budget:
+            already = set(matched)
+            results = process.extract(
+                needle,
+                candidates,
+                scorer=Indel.normalized_similarity,
+                score_cutoff=0.3,
+                limit=max(budget * 10, 5000),
+            )
+            for _, _, i in results:
+                if i in already:
+                    continue
+                candidate = candidates[i]
+                pos = -1
+                for char in needle:
+                    pos = candidate.find(char, pos + 1)
+                    if pos == -1:
+                        break
+                else:
+                    matched.append(i)
+                    if len(matched) == MAX_RESULTS:
+                        break
+        return [names[i] for i in matched], match_count
+
+    def _populate_options(self) -> None:
+        """Rebuild ``#left_panel`` from ``_view_names`` ranked against the filter.
+
+        Ranking is purely client-side fuzzy matching (``_match_names``) over the
+        in-memory list — no dnf calls — capped at ``MAX_RESULTS`` so the
+        OptionList rebuild stays cheap. Glyph precedence is ⬆️ (upgradable)
+        over ✅ (installed) — a package can be both installed and have an
+        upgrade available. When filtered, ``#options_text`` shows a match-count
+        hint unless a dnf action's status owns it (``_status_active``).
+        """
+        names, match_count = self._match_names(self._filter)
         options = [
             Option(
                 f"⬆️ {name}" if name in self._upgradable
@@ -384,10 +492,22 @@ class DnfseekApp(App):
             for name in names
         ]
         left = self.query_one("#left_panel", OptionList)
-        left.clear_options()
-        left.add_options(options)
+        left.set_options(options)
         if options:
             left.highlighted = 0
+        if not self._status_active:
+            hint = DEFAULT_HINT
+            if self._filter:
+                if not names:
+                    hint = f'No matches for "{self._filter}"'
+                elif match_count > len(names):
+                    hint = (
+                        f"Top {len(names)} of {match_count} matches — "
+                        "keep typing to narrow"
+                    )
+                else:
+                    hint = f"{len(names)} matches"
+            self.query_one("#options_text", Static).update(hint)
 
     async def search_all(self) -> None:
         """Command-palette "Search all" — installed | available."""
@@ -412,27 +532,27 @@ class DnfseekApp(App):
     async def _show_packages(self, installed_only: bool) -> None:
         """Ensure cache freshness, set the view's names, reset the filter, render."""
         await self._ensure_cache()
-        if installed_only:
-            names = sorted(self._installed)
-        else:
-            names = sorted(self._installed | self._available)
-        self._view_names = names
+        self._rebuild_view_names(installed_only)
         self._filter = ""
         self.query_one("#input", Input).value = ""
         self._populate_options()
 
     def on_input_changed(self, event: Input.Changed) -> None:
-        """Client-side filter handler for ``#input``.
+        """Debounced re-rank for ``#input``.
 
-        The ``event.value == self._filter`` guard skips redundant re-renders:
-        textual re-emits Changed on focus even when the value didn't change.
+        The ``event.value == self._filter`` guard skips redundant work (textual
+        re-emits Changed on focus even when the value didn't change). The rank
+        + OptionList rebuild takes ~100ms, so rapid typing is debounced via
+        ``FILTER_DEBOUNCE`` rather than re-ranking on every keystroke.
         """
         if event.input.id != "input":
             return
         if event.value == self._filter:
             return
         self._filter = event.value
-        self._populate_options()
+        if self._filter_timer is not None:
+            self._filter_timer.stop()
+        self._filter_timer = self.set_timer(FILTER_DEBOUNCE, self._populate_options)
 
     def _selected_package(self) -> str | None:
         """Return the highlighted package's id (its ``name.arch``), or None."""
@@ -686,6 +806,7 @@ class DnfseekApp(App):
         self._upgradable.discard(name)
         self._info_cache.pop(name, None)
         self._deps_cache.pop(name, None)
+        self._rebuild_view_names(self._installed_only)
         self._populate_options()
         self.run_worker(
             self._sync_cache_files(),
@@ -702,6 +823,7 @@ class DnfseekApp(App):
         self._upgradable.discard(name)
         self._info_cache.pop(name, None)
         self._deps_cache.pop(name, None)
+        self._rebuild_view_names(self._installed_only)
         self._populate_options()
         self.run_worker(
             self._sync_cache_files(),
@@ -859,12 +981,18 @@ class DnfseekApp(App):
         return f"Running: {' '.join(args)}"
 
     def _show_status(self, message: str) -> None:
-        """Un-hide ``#spinner`` (the ``.hidden`` rule in main.tcss sets display:none) and set ``#options_text``."""
+        """Un-hide ``#spinner`` (the ``.hidden`` rule in main.tcss sets display:none) and set ``#options_text``.
+
+        Sets ``_status_active`` so ``_populate_options``'s match-count hint
+        doesn't clobber the action message.
+        """
+        self._status_active = True
         self.query_one("#spinner", LoadingIndicator).remove_class("hidden")
         self.query_one("#options_text", Static).update(message)
 
     def _hide_status(self) -> None:
         """Re-hide ``#spinner`` and restore ``#options_text`` to ``DEFAULT_HINT``."""
+        self._status_active = False
         self.query_one("#spinner", LoadingIndicator).add_class("hidden")
         self.query_one("#options_text", Static).update(DEFAULT_HINT)
 

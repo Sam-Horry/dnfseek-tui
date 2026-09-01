@@ -18,6 +18,7 @@ import re
 import tempfile
 import time
 from pathlib import Path
+from statistics import mode
 from typing import Iterable
 
 from rapidfuzz import process
@@ -149,8 +150,9 @@ class DnfseekApp(App):
         # Casefolded twin of ``_view_names``, built once per view change in
         # ``_rebuild_view_names`` — the per-keystroke fuzzy ranker never casefolds.
         self._view_cf: list[str] = []
-        # The view mode last requested (see ``_rebuild_view_names``).
-        self._installed_only = False
+        # The view mode last requested: "all" | "installed" | "upgradeable"
+        # (see ``_rebuild_view_names``).
+        self._view_mode = "all"
         self._filter = ""
         # Pending debounce timer for ``on_input_changed`` re-ranking.
         self._filter_timer: Timer | None = None
@@ -182,7 +184,7 @@ class DnfseekApp(App):
         # Runs ``_show_packages(installed_only=False)`` in a worker; the
         # ``exclusive=True`` group cancels any prior search worker mid-flight.
         self.run_worker(
-            self._show_packages(installed_only=False),
+            self._show_packages(mode="all"),
             name="search-all",
             group="search",
             exclusive=True,
@@ -236,6 +238,9 @@ class DnfseekApp(App):
         )
         yield SystemCommand(
             "Search installed", "Search installed packages", self.search_installed
+        )
+        yield SystemCommand(
+            "Search upgradeable", "Search upgradeable packages", self.search_upgradable
         )
         yield SystemCommand(
             "Install package", "Install the highlighted package with dnf",
@@ -372,7 +377,7 @@ class DnfseekApp(App):
         self._installed = set(installed_names)
         self._available = set(available_names)
         self._upgradable = set(upgradable_names)
-        self._rebuild_view_names(self._installed_only)
+        self._rebuild_view_names(self._view_mode)
         self._populate_options()
         self.notify("Package lists refreshed", severity="information")
 
@@ -403,17 +408,18 @@ class DnfseekApp(App):
             exit_on_error=False,
         )
 
-    def _rebuild_view_names(self, installed_only: bool) -> None:
+    def _rebuild_view_names(self, mode: str) -> None:
         """Set ``_view_names`` (and its casefolded twin ``_view_cf``) from the
         current package sets. Called on view switches and after install/remove
-        mutations so the ranked list always reflects ``_installed``/``_available``.
+        mutations so the ranked list always reflects ``_installed``/``_available``/``_upgradeable``.
         """
-        self._installed_only = installed_only
-        names = (
-            sorted(self._installed)
-            if installed_only
-            else sorted(self._installed | self._available)
-        )
+        self._view_mode = mode
+        if mode == "installed":
+            names = sorted(self._installed)
+        elif mode == "upgradable":
+            names = sorted(self._upgradable)
+        else:
+            names = sorted(self._available | self._installed)
         self._view_names = names
         self._view_cf = [name.casefold() for name in names]
 
@@ -570,7 +576,7 @@ class DnfseekApp(App):
     async def search_all(self) -> None:
         """Command-palette "Search all" — installed | available."""
         self.run_worker(
-            self._show_packages(installed_only=False),
+            self._show_packages(mode="all"),
             name="search-all",
             group="search",
             exclusive=True,
@@ -580,17 +586,27 @@ class DnfseekApp(App):
     async def search_installed(self) -> None:
         """Command-palette "Search installed" — installed only."""
         self.run_worker(
-            self._show_packages(installed_only=True),
+            self._show_packages(mode="installed"),
             name="show-installed",
             group="search",
             exclusive=True,
             exit_on_error=False,
         )
 
-    async def _show_packages(self, installed_only: bool) -> None:
+    async def search_upgradable(self) -> None:
+        """Command-palette "Search upgradable" - packages with updates only"""
+        self.run_worker(
+            self._show_packages(mode="upgradable"),
+            name="search-upgradable",
+            group="search",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _show_packages(self, mode: str) -> None:
         """Ensure cache freshness, set the view's names, reset the filter, render."""
         await self._ensure_cache()
-        self._rebuild_view_names(installed_only)
+        self._rebuild_view_names(mode)
         self._filter = ""
         self.query_one("#input", Input).value = ""
         self._populate_options()
@@ -864,7 +880,7 @@ class DnfseekApp(App):
         self._upgradable.discard(name)
         self._info_cache.pop(name, None)
         self._deps_cache.pop(name, None)
-        self._rebuild_view_names(self._installed_only)
+        self._rebuild_view_names(self._view_mode)
         self._populate_options()
         self.run_worker(
             self._sync_cache_files(),
@@ -881,7 +897,7 @@ class DnfseekApp(App):
         self._upgradable.discard(name)
         self._info_cache.pop(name, None)
         self._deps_cache.pop(name, None)
-        self._rebuild_view_names(self._installed_only)
+        self._rebuild_view_names(self._view_mode)
         self._populate_options()
         self.run_worker(
             self._sync_cache_files(),

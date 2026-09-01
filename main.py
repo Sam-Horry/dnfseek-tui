@@ -18,6 +18,7 @@ import re
 import tempfile
 import time
 from pathlib import Path
+from statistics import mode
 from typing import Iterable
 
 from rapidfuzz import process
@@ -82,7 +83,8 @@ LAZY_PAUSE = 0.01  # seconds between chunks (let the screen paint)
 class PackageList(OptionList):
     """Left-panel package list.
 
-    Subclassed to bind ``space`` to select (triggering the info preview) and
+    Subclassed to bind ``space`` to select (triggering the info preview),
+    ``j``/``k`` for vim-style navigation, and
     to make ``get_content_height`` O(1): every option is a single line (a
     package name, never wrapped, no divider rows), so the content height is
     just the option count. The base implementation sums per-option heights on
@@ -93,10 +95,36 @@ class PackageList(OptionList):
 
     BINDINGS = [
         Binding("space", "select", "Select", show=False),
+        Binding("j", "cursor_down", "Down", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
     ]
 
     def get_content_height(self, container: Size, viewport: Size, width: int) -> int:
         return self.option_count
+
+
+# Editing chords that ``DnfseekApp.BINDINGS`` overrides with app-level actions
+# (ctrl+c/d/e/u/x; ctrl+y is new for install). They are already dead while
+# typing (the app bindings are priority=True and win), but keeping them on the
+# Input perturbed the Footer: the footer renders ``screen.active_bindings`` in
+# dict-insertion order, and the Input's own chords were inserted first, so the
+# shown keys were reordered depending on which panel had focus.
+HIJACKED_KEYS = {"ctrl+c", "ctrl+d", "ctrl+e", "ctrl+u", "ctrl+x"}
+
+
+class DnfseekInput(Input, inherit_bindings=False):
+    """``#input`` — an Input without the chords hijacked by app-level actions.
+
+    ``inherit_bindings=False`` makes this filtered list fully replace
+    ``Input.BINDINGS`` instead of merging with it (a removed key would
+    otherwise resurface from the base class).
+    """
+
+    BINDINGS = [
+        binding
+        for binding in Input.BINDINGS
+        if not (set(binding.key.split(",")) & HIJACKED_KEYS)
+    ]
 
 
 class DnfseekApp(App):
@@ -115,15 +143,20 @@ class DnfseekApp(App):
     SUB_TITLE = "a TUI dnf wrapper"
 
     # Key → action_* method (textual convention). Listed in the Footer and in
-    # the command palette (see ``get_system_commands``).
+    # the command palette (see ``get_system_commands``). All dnfseek actions are
+    # ctrl+ chords with ``priority=True`` so they fire even while ``#input`` has
+    # focus: plain keys would be typed into the field, and the Input widget's
+    # own ctrl+a/e/d/u/x/c editing bindings would otherwise win for the same
+    # chord. ``ctrl+c`` also overrides Textual's default (help-quit/copy) to quit.
     BINDINGS = [
-        ("u", "upgrade_all", "Upgrade all packages"),
-        ("r", "refresh_cache", "Refresh cache"),
-        ("i", "install", "Install package"),
-        ("x", "remove", "Remove package"),
-        ("e", "reinstall", "Reinstall package"),
-        ("g", "update_package", "Update package"),
-        ("d", "deps", "Show dependencies"),
+        Binding("ctrl+u", "upgrade_all", "Upgrade all", priority=True),
+        Binding("ctrl+r", "refresh_cache", "Refresh cache", priority=True),
+        Binding("ctrl+y", "install", "Install", priority=True),
+        Binding("ctrl+x", "remove", "Remove", priority=True),
+        Binding("ctrl+e", "reinstall", "Reinstall", priority=True),
+        Binding("ctrl+g", "update_package", "Update", priority=True),
+        Binding("ctrl+d", "deps", "Show dependencies", priority=True),
+        Binding("ctrl+c", "quit", "Quit", priority=True),
     ]
 
     def __init__(self) -> None:
@@ -149,8 +182,9 @@ class DnfseekApp(App):
         # Casefolded twin of ``_view_names``, built once per view change in
         # ``_rebuild_view_names`` — the per-keystroke fuzzy ranker never casefolds.
         self._view_cf: list[str] = []
-        # The view mode last requested (see ``_rebuild_view_names``).
-        self._installed_only = False
+        # The view mode last requested: "all" | "installed" | "upgradeable"
+        # (see ``_rebuild_view_names``).
+        self._view_mode = "all"
         self._filter = ""
         # Pending debounce timer for ``on_input_changed`` re-ranking.
         self._filter_timer: Timer | None = None
@@ -170,7 +204,7 @@ class DnfseekApp(App):
 
         with Horizontal():
             with Vertical():
-                yield Input(placeholder="Type Package Name", id="input")
+                yield DnfseekInput(placeholder="Type Package Name", id="input")
                 yield PackageList(id="left_panel", markup=False)
             yield Static("Select a package (enter/space) to view its information", id="right_panel", markup=False)
         yield Footer()
@@ -182,7 +216,7 @@ class DnfseekApp(App):
         # Runs ``_show_packages(installed_only=False)`` in a worker; the
         # ``exclusive=True`` group cancels any prior search worker mid-flight.
         self.run_worker(
-            self._show_packages(installed_only=False),
+            self._show_packages(mode="all"),
             name="search-all",
             group="search",
             exclusive=True,
@@ -236,6 +270,9 @@ class DnfseekApp(App):
         )
         yield SystemCommand(
             "Search installed", "Search installed packages", self.search_installed
+        )
+        yield SystemCommand(
+            "Search upgradeable", "Search upgradeable packages", self.search_upgradable
         )
         yield SystemCommand(
             "Install package", "Install the highlighted package with dnf",
@@ -372,7 +409,7 @@ class DnfseekApp(App):
         self._installed = set(installed_names)
         self._available = set(available_names)
         self._upgradable = set(upgradable_names)
-        self._rebuild_view_names(self._installed_only)
+        self._rebuild_view_names(self._view_mode)
         self._populate_options()
         self.notify("Package lists refreshed", severity="information")
 
@@ -403,17 +440,18 @@ class DnfseekApp(App):
             exit_on_error=False,
         )
 
-    def _rebuild_view_names(self, installed_only: bool) -> None:
+    def _rebuild_view_names(self, mode: str) -> None:
         """Set ``_view_names`` (and its casefolded twin ``_view_cf``) from the
         current package sets. Called on view switches and after install/remove
-        mutations so the ranked list always reflects ``_installed``/``_available``.
+        mutations so the ranked list always reflects ``_installed``/``_available``/``_upgradeable``.
         """
-        self._installed_only = installed_only
-        names = (
-            sorted(self._installed)
-            if installed_only
-            else sorted(self._installed | self._available)
-        )
+        self._view_mode = mode
+        if mode == "installed":
+            names = sorted(self._installed)
+        elif mode == "upgradable":
+            names = sorted(self._upgradable)
+        else:
+            names = sorted(self._available | self._installed)
         self._view_names = names
         self._view_cf = [name.casefold() for name in names]
 
@@ -570,7 +608,7 @@ class DnfseekApp(App):
     async def search_all(self) -> None:
         """Command-palette "Search all" — installed | available."""
         self.run_worker(
-            self._show_packages(installed_only=False),
+            self._show_packages(mode="all"),
             name="search-all",
             group="search",
             exclusive=True,
@@ -580,17 +618,27 @@ class DnfseekApp(App):
     async def search_installed(self) -> None:
         """Command-palette "Search installed" — installed only."""
         self.run_worker(
-            self._show_packages(installed_only=True),
+            self._show_packages(mode="installed"),
             name="show-installed",
             group="search",
             exclusive=True,
             exit_on_error=False,
         )
 
-    async def _show_packages(self, installed_only: bool) -> None:
+    async def search_upgradable(self) -> None:
+        """Command-palette "Search upgradable" - packages with updates only"""
+        self.run_worker(
+            self._show_packages(mode="upgradable"),
+            name="search-upgradable",
+            group="search",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _show_packages(self, mode: str) -> None:
         """Ensure cache freshness, set the view's names, reset the filter, render."""
         await self._ensure_cache()
-        self._rebuild_view_names(installed_only)
+        self._rebuild_view_names(mode)
         self._filter = ""
         self.query_one("#input", Input).value = ""
         self._populate_options()
@@ -621,12 +669,14 @@ class DnfseekApp(App):
         """Append the contextual Actions footer to a block of info/deps text.
 
         The footer varies by installed state and gains a ⬆️ line when an
-        upgrade is available. (Footer will be replaced by tab labels per PLAN.md.)
+        upgrade is available. Keys are shown as ``^`` chords to match the
+        app-level ``ctrl+`` bindings (^y = ctrl+y install). (Footer will be
+        replaced by tab labels per PLAN.md.)
         """
         if name in self._installed:
-            actions = "x Remove | e Reinstall | g Update | d Dependencies"
+            actions = "^x Remove | ^e Reinstall | ^g Update | ^d Dependencies"
         else:
-            actions = "i Install | d Dependencies"
+            actions = "^y Install | ^d Dependencies"
         suffix = "\n⬆️ Update available" if name in self._upgradable else ""
         return f"{content}\n\n── Actions ──\n{actions}{suffix}"
 
@@ -864,7 +914,7 @@ class DnfseekApp(App):
         self._upgradable.discard(name)
         self._info_cache.pop(name, None)
         self._deps_cache.pop(name, None)
-        self._rebuild_view_names(self._installed_only)
+        self._rebuild_view_names(self._view_mode)
         self._populate_options()
         self.run_worker(
             self._sync_cache_files(),
@@ -881,7 +931,7 @@ class DnfseekApp(App):
         self._upgradable.discard(name)
         self._info_cache.pop(name, None)
         self._deps_cache.pop(name, None)
-        self._rebuild_view_names(self._installed_only)
+        self._rebuild_view_names(self._view_mode)
         self._populate_options()
         self.run_worker(
             self._sync_cache_files(),

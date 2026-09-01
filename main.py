@@ -83,7 +83,8 @@ LAZY_PAUSE = 0.01  # seconds between chunks (let the screen paint)
 class PackageList(OptionList):
     """Left-panel package list.
 
-    Subclassed to bind ``space`` to select (triggering the info preview) and
+    Subclassed to bind ``space`` to select (triggering the info preview),
+    ``j``/``k`` for vim-style navigation, and
     to make ``get_content_height`` O(1): every option is a single line (a
     package name, never wrapped, no divider rows), so the content height is
     just the option count. The base implementation sums per-option heights on
@@ -94,10 +95,36 @@ class PackageList(OptionList):
 
     BINDINGS = [
         Binding("space", "select", "Select", show=False),
+        Binding("j", "cursor_down", "Down", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
     ]
 
     def get_content_height(self, container: Size, viewport: Size, width: int) -> int:
         return self.option_count
+
+
+# Editing chords that ``DnfseekApp.BINDINGS`` overrides with app-level actions
+# (ctrl+c/d/e/u/x; ctrl+y is new for install). They are already dead while
+# typing (the app bindings are priority=True and win), but keeping them on the
+# Input perturbed the Footer: the footer renders ``screen.active_bindings`` in
+# dict-insertion order, and the Input's own chords were inserted first, so the
+# shown keys were reordered depending on which panel had focus.
+HIJACKED_KEYS = {"ctrl+c", "ctrl+d", "ctrl+e", "ctrl+u", "ctrl+x"}
+
+
+class DnfseekInput(Input, inherit_bindings=False):
+    """``#input`` — an Input without the chords hijacked by app-level actions.
+
+    ``inherit_bindings=False`` makes this filtered list fully replace
+    ``Input.BINDINGS`` instead of merging with it (a removed key would
+    otherwise resurface from the base class).
+    """
+
+    BINDINGS = [
+        binding
+        for binding in Input.BINDINGS
+        if not (set(binding.key.split(",")) & HIJACKED_KEYS)
+    ]
 
 
 class DnfseekApp(App):
@@ -116,15 +143,20 @@ class DnfseekApp(App):
     SUB_TITLE = "a TUI dnf wrapper"
 
     # Key → action_* method (textual convention). Listed in the Footer and in
-    # the command palette (see ``get_system_commands``).
+    # the command palette (see ``get_system_commands``). All dnfseek actions are
+    # ctrl+ chords with ``priority=True`` so they fire even while ``#input`` has
+    # focus: plain keys would be typed into the field, and the Input widget's
+    # own ctrl+a/e/d/u/x/c editing bindings would otherwise win for the same
+    # chord. ``ctrl+c`` also overrides Textual's default (help-quit/copy) to quit.
     BINDINGS = [
-        ("u", "upgrade_all", "Upgrade all packages"),
-        ("r", "refresh_cache", "Refresh cache"),
-        ("i", "install", "Install package"),
-        ("x", "remove", "Remove package"),
-        ("e", "reinstall", "Reinstall package"),
-        ("g", "update_package", "Update package"),
-        ("d", "deps", "Show dependencies"),
+        Binding("ctrl+u", "upgrade_all", "Upgrade all", priority=True),
+        Binding("ctrl+r", "refresh_cache", "Refresh cache", priority=True),
+        Binding("ctrl+y", "install", "Install", priority=True),
+        Binding("ctrl+x", "remove", "Remove", priority=True),
+        Binding("ctrl+e", "reinstall", "Reinstall", priority=True),
+        Binding("ctrl+g", "update_package", "Update", priority=True),
+        Binding("ctrl+d", "deps", "Show dependencies", priority=True),
+        Binding("ctrl+c", "quit", "Quit", priority=True),
     ]
 
     def __init__(self) -> None:
@@ -172,7 +204,7 @@ class DnfseekApp(App):
 
         with Horizontal():
             with Vertical():
-                yield Input(placeholder="Type Package Name", id="input")
+                yield DnfseekInput(placeholder="Type Package Name", id="input")
                 yield PackageList(id="left_panel", markup=False)
             yield Static("Select a package (enter/space) to view its information", id="right_panel", markup=False)
         yield Footer()
@@ -637,12 +669,14 @@ class DnfseekApp(App):
         """Append the contextual Actions footer to a block of info/deps text.
 
         The footer varies by installed state and gains a ⬆️ line when an
-        upgrade is available. (Footer will be replaced by tab labels per PLAN.md.)
+        upgrade is available. Keys are shown as ``^`` chords to match the
+        app-level ``ctrl+`` bindings (^y = ctrl+y install). (Footer will be
+        replaced by tab labels per PLAN.md.)
         """
         if name in self._installed:
-            actions = "x Remove | e Reinstall | g Update | d Dependencies"
+            actions = "^x Remove | ^e Reinstall | ^g Update | ^d Dependencies"
         else:
-            actions = "i Install | d Dependencies"
+            actions = "^y Install | ^d Dependencies"
         suffix = "\n⬆️ Update available" if name in self._upgradable else ""
         return f"{content}\n\n── Actions ──\n{actions}{suffix}"
 

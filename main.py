@@ -38,6 +38,7 @@ from textual.widgets import (
     Footer,
     OptionList,
     LoadingIndicator,
+    RichLog,
 )
 # ``Option`` is NOT exported from ``textual.widgets`` in textual 8.2.8, so it
 # must be imported from the private ``_option_list`` module. Used to build the
@@ -135,7 +136,7 @@ class DnfseekApp(App):
         ``main.tcss`` sets ``display: none``) and ``#options_text``.
       * ``#input`` — client-side filter over the in-memory list.
       * ``#left_panel`` — this ``PackageList`` (virtualized OptionList).
-      * ``#right_panel`` — info/deps/output preview ``Static``.
+      * ``#right_panel`` — info/deps/output preview ``RichLog`` (scrollable).
     """
 
     CSS_PATH = "main.tcss"
@@ -206,13 +207,15 @@ class DnfseekApp(App):
             with Vertical():
                 yield DnfseekInput(placeholder="Type Package Name", id="input")
                 yield PackageList(id="left_panel", markup=False)
-            yield Static("Select a package (enter/space) to view its information", id="right_panel", markup=False)
+            # Scrollable info/deps/output log (wraps dnf5's wide tables).
+            yield RichLog(id="right_panel", wrap=True, markup=False, max_lines=2000)
         yield Footer()
 
     def on_mount(self) -> None:
         """Boot straight into "Search all" so the list is never blank."""
         self.theme_changed_signal.subscribe(self, self._save_theme)
         self.styles.scrollbar_visibility = "hidden"
+        self._show_panel("Select a package (enter/space) to view its information")
         # Runs ``_show_packages(installed_only=False)`` in a worker; the
         # ``exclusive=True`` group cancels any prior search worker mid-flight.
         self.run_worker(
@@ -693,14 +696,13 @@ class DnfseekApp(App):
         if name is None:
             return
         self._active_package = name
-        right_panel = self.query_one("#right_panel", Static)
         if name in self._info_cache:
-            right_panel.update(self._format_info(name, self._info_cache[name]))
+            self._show_panel(self._format_info(name, self._info_cache[name]))
             return
         if name in self._pending_fetches:
             return
         self._pending_fetches.add(name)
-        right_panel.update(f"Fetching info for {name}...")
+        self._show_panel(f"Fetching info for {name}...")
         self.run_worker(
             self._fetch_package_info(name),
             name=f"info-{name}",
@@ -734,9 +736,7 @@ class DnfseekApp(App):
         info = "\n".join(lines)
         self._info_cache[name] = info
         if name == self._active_package:
-            self.query_one("#right_panel", Static).update(
-                self._format_info(name, info)
-            )
+            self._show_panel(self._format_info(name, info))
 
     def action_install(self) -> None:
         """``i`` — install the highlighted package via ``dnf install``.
@@ -854,11 +854,10 @@ class DnfseekApp(App):
         if name is None:
             self.notify("No package selected", severity="warning")
             return
-        right_panel = self.query_one("#right_panel", Static)
         if name in self._deps_cache:
-            right_panel.update(self._format_info(name, self._deps_cache[name]))
+            self._show_panel(self._format_info(name, self._deps_cache[name]))
             return
-        right_panel.update(f"Fetching dependencies for {name}...")
+        self._show_panel(f"Fetching dependencies for {name}...")
         self.run_worker(
             self._fetch_deps(name),
             name=f"deps-{name}",
@@ -874,15 +873,14 @@ class DnfseekApp(App):
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, _ = await process.communicate()
-        right_panel = self.query_one("#right_panel", Static)
         if process.returncode != 0:
-            right_panel.update(f"Could not fetch dependencies for {name}")
+            self._show_panel(f"Could not fetch dependencies for {name}")
             self.notify(f"Could not fetch dependencies for {name}", severity="error")
             return
         deps = [line.strip() for line in stdout.decode().splitlines() if line.strip()]
         text = "\n".join(deps) if deps else "No dependencies"
         self._deps_cache[name] = text
-        right_panel.update(self._format_info(name, text))
+        self._show_panel(self._format_info(name, text))
 
     def _restore_package_info(self, name: str) -> None:
         """Re-show info for a package after a dnf action mutated state.
@@ -892,9 +890,7 @@ class DnfseekApp(App):
         """
         self._active_package = name
         if name in self._info_cache:
-            self.query_one("#right_panel", Static).update(
-                self._format_info(name, self._info_cache[name])
-            )
+            self._show_panel(self._format_info(name, self._info_cache[name]))
         else:
             self.run_worker(
                 self._fetch_package_info(name),
@@ -991,10 +987,9 @@ class DnfseekApp(App):
             and classify the common dnf messages (already installed /
             already latest / nothing-to-do) into friendlier notifications.
         """
-        right_panel = self.query_one("#right_panel", Static)
         self._show_status(self._action_status(args, name))
         try:
-            right_panel.update(f"Running: {' '.join(args)}")
+            self._show_panel(f"Running: {' '.join(args)}")
             returncode, stderr = await self._sudo_once(args)
             if returncode != 0 and (
                 b"a password is required" in stderr.lower()
@@ -1024,7 +1019,7 @@ class DnfseekApp(App):
                 error_text = stderr_text.lower()
                 if stderr:
                     error_lines = stderr_text.splitlines()[-10:]
-                    right_panel.update("\n".join(error_lines))
+                    self._show_panel("\n".join(error_lines))
                 if "already installed" in error_text:
                     self.notify(
                         f"{name or 'Package'} is already installed", severity="warning"
@@ -1055,7 +1050,6 @@ class DnfseekApp(App):
         Returns ``(returncode, stderr_bytes)``; ``returncode or 0`` coerces the
         ``None`` that ``create_subprocess_exec`` can leave behind before wait().
         """
-        right_panel = self.query_one("#right_panel", Static)
         process = await asyncio.create_subprocess_exec(
             "sudo", "-n", *args,
             stdout=asyncio.subprocess.PIPE,
@@ -1067,7 +1061,7 @@ class DnfseekApp(App):
             for line in chunk.decode(errors="replace").replace("\r", "\n").splitlines():
                 if line.strip():
                     lines.append(line.strip())
-            right_panel.update("\n".join(lines[-15:]))
+            self._show_panel("\n".join(lines[-15:]))
         stderr = await stderr_task
         await process.wait()
         return process.returncode or 0, stderr
@@ -1087,6 +1081,12 @@ class DnfseekApp(App):
                 return f"Upgrading {name}..."
             return "Upgrading all packages..."
         return f"Running: {' '.join(args)}"
+
+    def _show_panel(self, text: str) -> None:
+        """Replace the ``#right_panel`` log content (RichLog: clear + write)."""
+        log = self.query_one("#right_panel", RichLog)
+        log.clear()
+        log.write(text)
 
     def _show_status(self, message: str) -> None:
         """Un-hide ``#spinner`` (the ``.hidden`` rule in main.tcss sets display:none) and set ``#options_text``.

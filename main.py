@@ -1038,33 +1038,45 @@ class DnfseekApp(App):
             self._hide_status()
 
     async def _sudo_once(self, args: list[str]) -> tuple[int, bytes]:
-        """Run ``sudo -n <cmd> ...`` once, streaming stdout to ``#right_panel``.
+        """Run ``sudo -n <cmd> ...`` once, streaming both pipes to ``#right_panel``.
 
         Non-interactive sudo (validated up front by ``main()``'s ``sudo -v``).
-        stdout is streamed line-by-line into the panel showing only the last
-        15 lines (a scrollback-preserving RichLog is planned per PLAN.md).
-        stderr is read in parallel (``stderr_task``) so stderr buffering can't
-        deadlock the streaming stdout. ``--requires``-style messages are
-        matched case-insensitively against the raw **bytes** (``stderr.lower()``)
-        rather than decoded text, which is why the literals are byte strings.
-        Returns ``(returncode, stderr_bytes)``; ``returncode or 0`` coerces the
-        ``None`` that ``create_subprocess_exec`` can leave behind before wait().
+        stdout AND stderr are drained concurrently into the panel log — every
+        line is appended (full transcript, scrollback preserved). stderr is
+        streamed live rather than read once at the end because dnf5 >= 5.2
+        prints its live progress bars to stderr (dnf5 PR #1641); concurrent
+        drains also keep either pipe's buffering from deadlocking the other.
+        Every clean line goes through ``_handle_stream_line``. sudo-expiry
+        messages are matched case-insensitively against the raw **bytes**
+        (``stderr.lower()`` in ``_run_dnf``) rather than decoded text, which is
+        why the return value keeps stderr as bytes. Returns
+        ``(returncode, stderr_bytes)``; ``returncode or 0`` coerces the ``None``
+        that ``create_subprocess_exec`` can leave behind before wait().
         """
         process = await asyncio.create_subprocess_exec(
             "sudo", "-n", *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stderr_task = asyncio.create_task(process.stderr.read())
-        lines: list[str] = []
-        async for chunk in process.stdout:
-            for line in chunk.decode(errors="replace").replace("\r", "\n").splitlines():
-                if line.strip():
-                    lines.append(line.strip())
-            self._show_panel("\n".join(lines[-15:]))
+
+        async def drain(stream) -> bytes:
+            chunks: list[bytes] = []
+            async for chunk in stream:
+                chunks.append(chunk)
+                for line in chunk.decode(errors="replace").replace("\r", "\n").splitlines():
+                    if line.strip():
+                        self._handle_stream_line(line.strip())
+            return b"".join(chunks)
+
+        stderr_task = asyncio.create_task(drain(process.stderr))
+        await drain(process.stdout)
         stderr = await stderr_task
         await process.wait()
         return process.returncode or 0, stderr
+
+    def _handle_stream_line(self, line: str) -> None:
+        """Per-line sink for ``_sudo_once`` streams: append to ``#right_panel``."""
+        self.query_one("#right_panel", RichLog).write(line)
 
     @staticmethod
     def _action_status(args: list[str], name: str | None) -> str:

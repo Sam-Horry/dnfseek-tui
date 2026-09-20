@@ -877,6 +877,7 @@ class DnfseekApp(App):
                 ["dnf", "upgrade", "-y", name],
                 success_msg=f"Updated: {name}",
                 name=name,
+                installed="upgrade",
             ),
             name=f"update-{name}",
             group="dnf",
@@ -978,6 +979,62 @@ class DnfseekApp(App):
             exit_on_error=False,
         )
 
+    def _mark_upgraded(self, name: str) -> None:
+        """Drop ``name`` from ``_upgradable`` and invalidate its cached info.
+
+        The package stays installed, so installed/available sets are
+        untouched; the disk caches are re-synced to keep the upgradable file
+        consistent (mirrors ``_mark_installed``).
+        """
+        self._upgradable.discard(name)
+        self._info_cache.pop(name, None)
+        self._deps_cache.pop(name, None)
+        self._rebuild_view_names(self._view_mode)
+        self._populate_options()
+        self.run_worker(
+            self._sync_cache_files(),
+            name="cache-sync",
+            group="cache",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _sync_after_upgrade_all(self) -> None:
+        """Post-upgrade-all state sync (the ⬆️-markers-stay-stale bug fix).
+
+        ``dnf upgrade -y`` reports progress but, on success, previously did
+        NOT touch any app state — markers, the upgradable view and cached
+        info all stayed stale. This syncs: snapshot the pending set, clear
+        it, invalidate info/deps caches for those packages (a cache hit
+        would otherwise render old versions), re-render instantly, restore
+        the selected package's info panel, then re-check the upgradable set
+        in the background to re-add anything dnf skipped or that became
+        pending meanwhile (repoquery is the ground truth — ``upgrade -y``
+        can leave stragglers).
+        """
+        pending = set(self._upgradable)
+        self._upgradable.clear()
+        for name in pending:
+            self._info_cache.pop(name, None)
+            self._deps_cache.pop(name, None)
+        self._rebuild_view_names(self._view_mode)
+        self._populate_options()
+        if self._active_package is not None:
+            self._restore_package_info(self._active_package)
+        output = await self._dnf_list(
+            ["repoquery", "--upgrades", "--queryformat", "%{name}.%{arch}\n"]
+        )
+        remaining_names = self._parse_repoquery_set(output) if output else []
+        if remaining_names:
+            self._upgradable |= set(remaining_names)
+            self._rebuild_view_names(self._view_mode)
+            self._populate_options()
+            self.notify(
+                f"{len(remaining_names)} package(s) still have pending updates",
+                severity="warning",
+            )
+        await self._write_cache(UPGRADABLE_CACHE, remaining_names)
+
     async def _sync_cache_files(self) -> None:
         """Rewrite all three cache files from the current in-memory sets."""
         await asyncio.gather(
@@ -993,6 +1050,7 @@ class DnfseekApp(App):
             self._run_dnf(
                 ["dnf", "upgrade", "-y"],
                 success_msg="All packages upgraded!",
+                installed="upgrade_all",
             ),
             name="upgrade_all",
             group="dnf",
@@ -1022,8 +1080,11 @@ class DnfseekApp(App):
             "no password was provided") → notify + ``self.exit(result=...)``,
             which ``main()`` prints to stderr after the TUI restores the
             terminal. There is no in-app reauth path.
-          * returncode 0 → notify success, apply the cache-set mutation
-            (``installed="add"|"remove"``), refresh the panel.
+          * returncode 0 → notify success, then apply the post-transaction
+            cache-set mutation: ``installed="add"|"remove"|"upgrade"`` runs
+            the matching ``_mark_*`` helper for ``name``; ``"upgrade_all"``
+            runs the full ``_sync_after_upgrade_all`` sync; ``name`` alone
+            just restores its info panel.
           * non-zero → surface the last 10 stderr lines in ``#right_panel``
             and classify the common dnf messages (already installed /
             already latest / nothing-to-do) into friendlier notifications.
@@ -1053,6 +1114,11 @@ class DnfseekApp(App):
                 elif installed == "remove" and name is not None:
                     self._mark_removed(name)
                     self._restore_package_info(name)
+                elif installed == "upgrade" and name is not None:
+                    self._mark_upgraded(name)
+                    self._restore_package_info(name)
+                elif installed == "upgrade_all":
+                    await self._sync_after_upgrade_all()
                 elif name is not None:
                     self._restore_package_info(name)
             else:

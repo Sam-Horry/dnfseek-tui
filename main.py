@@ -738,12 +738,14 @@ class DnfseekApp(App):
             return
         self._active_package = name
         if name in self._info_cache:
-            self._show_panel(self._format_info(name, self._info_cache[name]))
+            if not self._status_active:
+                self._show_panel(self._format_info(name, self._info_cache[name]))
             return
         if name in self._pending_fetches:
             return
         self._pending_fetches.add(name)
-        self._show_panel(f"Fetching info for {name}...")
+        if not self._status_active:
+            self._show_panel(f"Fetching info for {name}...")
         self.run_worker(
             self._fetch_package_info(name),
             name=f"info-{name}",
@@ -758,7 +760,10 @@ class DnfseekApp(App):
         (Name/Summary/Version/Release/Size/URL/Description) rather than render
         the full output — see PLAN.md bundle 3 for the proposed full-output tab.
         The ``name == self._active_package`` guard avoids clobbering the panel
-        if the user selected a different package while this fetch ran.
+        if the user selected a different package while this fetch ran, and the
+        ``not _status_active`` guard keeps a late render from splicing itself
+        into a dnf action's streaming log (the action's completion path
+        re-renders the panel when it ends).
         """
         process = await asyncio.create_subprocess_exec(
             "dnf", "info", name,
@@ -776,7 +781,7 @@ class DnfseekApp(App):
         ]
         info = "\n".join(lines)
         self._info_cache[name] = info
-        if name == self._active_package:
+        if name == self._active_package and not self._status_active:
             self._show_panel(self._format_info(name, info))
 
     def action_install(self) -> None:
@@ -927,12 +932,15 @@ class DnfseekApp(App):
     def _restore_package_info(self, name: str) -> None:
         """Re-show info for a package after a dnf action mutated state.
 
-        Cache hit → render immediately; otherwise kick a fresh ``dnf info``
-        fetch (the cached entry was just invalidated by ``_mark_*``).
+        Cache hit → render immediately; a fetch already in flight is left to
+        render on completion; otherwise kick a fresh ``dnf info`` fetch (the
+        cached entry was just invalidated by ``_mark_*``).
         """
         self._active_package = name
         if name in self._info_cache:
             self._show_panel(self._format_info(name, self._info_cache[name]))
+        elif name in self._pending_fetches:
+            return
         else:
             self.run_worker(
                 self._fetch_package_info(name),
@@ -1006,11 +1014,12 @@ class DnfseekApp(App):
         NOT touch any app state — markers, the upgradable view and cached
         info all stayed stale. This syncs: snapshot the pending set, clear
         it, invalidate info/deps caches for those packages (a cache hit
-        would otherwise render old versions), re-render instantly, restore
-        the selected package's info panel, then re-check the upgradable set
-        in the background to re-add anything dnf skipped or that became
-        pending meanwhile (repoquery is the ground truth — ``upgrade -y``
-        can leave stragglers).
+        would otherwise render old versions), re-render instantly, then
+        re-check the upgradable set in the background to re-add anything dnf
+        skipped or that became pending meanwhile (repoquery is the ground
+        truth — ``upgrade -y`` can leave stragglers). Restoring the selected
+        package's info panel is owned by ``_run_dnf`` (it must happen after
+        ``_hide_status``).
         """
         pending = set(self._upgradable)
         self._upgradable.clear()
@@ -1019,8 +1028,6 @@ class DnfseekApp(App):
             self._deps_cache.pop(name, None)
         self._rebuild_view_names(self._view_mode)
         self._populate_options()
-        if self._active_package is not None:
-            self._restore_package_info(self._active_package)
         output = await self._dnf_list(
             ["repoquery", "--upgrades", "--queryformat", "%{name}.%{arch}\n"]
         )
@@ -1084,12 +1091,16 @@ class DnfseekApp(App):
             cache-set mutation: ``installed="add"|"remove"|"upgrade"`` runs
             the matching ``_mark_*`` helper for ``name``; ``"upgrade_all"``
             runs the full ``_sync_after_upgrade_all`` sync; ``name`` alone
-            just restores its info panel.
+            just marks the info panel for restore. The restore itself runs
+            AFTER ``_hide_status`` — an in-flight info fetch whose completion
+            render is suppressed while ``_status_active`` would otherwise
+            leave the panel on the dnf transcript.
           * non-zero → surface the last 10 stderr lines in ``#right_panel``
             and classify the common dnf messages (already installed /
             already latest / nothing-to-do) into friendlier notifications.
         """
         self._show_status(self._action_status(args, name))
+        restore_name: str | None = None
         try:
             self._show_panel(f"Running: {' '.join(args)}")
             returncode, stderr = await self._sudo_once(args)
@@ -1110,17 +1121,18 @@ class DnfseekApp(App):
                 self.notify(success_msg, timeout=2, severity="information")
                 if installed == "add" and name is not None:
                     self._mark_installed(name)
-                    self._restore_package_info(name)
+                    restore_name = name
                 elif installed == "remove" and name is not None:
                     self._mark_removed(name)
-                    self._restore_package_info(name)
+                    restore_name = name
                 elif installed == "upgrade" and name is not None:
                     self._mark_upgraded(name)
-                    self._restore_package_info(name)
+                    restore_name = name
                 elif installed == "upgrade_all":
                     await self._sync_after_upgrade_all()
+                    restore_name = self._active_package
                 elif name is not None:
-                    self._restore_package_info(name)
+                    restore_name = name
             else:
                 stderr_text = stderr.decode(errors="replace")
                 error_text = stderr_text.lower()
@@ -1143,6 +1155,8 @@ class DnfseekApp(App):
                     )
         finally:
             self._hide_status()
+        if restore_name is not None:
+            self._restore_package_info(restore_name)
 
     async def _sudo_once(self, args: list[str]) -> tuple[int, bytes]:
         """Run ``sudo -n <cmd> ...`` once, streaming both pipes to ``#right_panel``.

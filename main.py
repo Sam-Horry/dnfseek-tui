@@ -80,6 +80,25 @@ LAZY_THRESHOLD = 2000
 LAZY_CHUNK = 2000
 LAZY_PAUSE = 0.01  # seconds between chunks (let the screen paint)
 
+# Live dnf5 transaction progress parsing (formats verified against a real
+# 5.4.5 capture, see PLAN.md). Downloads stream as
+# ``[N/M] <nevra> 100% | speed | size | time`` (no verb); the transaction
+# prints ``Running transaction`` then ``[N/M] <Verb> <nevra> 100% | ...`` per
+# package op, with "Verify package files"/"Prepare transaction" housekeeping
+# steps in between (not package ops). A "Removing" step is the shadow op of a
+# package the summary already counted (as "Replacing:"/reinstall), so it
+# counts toward done. Totals come from the "Transaction Summary:" block on
+# stdout, one `` <Verb>:   N package`` line per op category (gettext singular
+# and plural).
+_PROGRESS_VERBS = frozenset(
+    {"Installing", "Upgrading", "Reinstalling", "Downgrading", "Replacing", "Removing"}
+)
+_PROGRESS_ITEM_RE = re.compile(r"^\[(\d+)/(\d+)\]\s+(\S+)\b")
+_PROGRESS_SUMMARY_RE = re.compile(
+    r"^\s*(Installing|Reinstalling|Upgrading|Replacing|Removing|Downgrading):"
+    r"\s*(\d+)\s+packages?\s*$"
+)
+
 
 class PackageList(OptionList):
     """Left-panel package list.
@@ -192,6 +211,17 @@ class DnfseekApp(App):
         # True while a dnf action's status owns ``#options_text`` — keeps
         # ``_populate_options``'s match-count hint from clobbering it.
         self._status_active = False
+        # Live transaction progress, parsed from the streamed dnf5 output by
+        # ``_parse_progress_line`` (rendered by the ``#options`` progress bar;
+        # reset at the start of every ``_sudo_once``). Download-phase numbers
+        # are counter-based (``_dl_*``); transaction ``_txn_total`` comes from
+        # the "Transaction Summary:" block because the run counter's M
+        # includes non-package housekeeping steps.
+        self._txn_phase: str | None = None  # None | "download" | "transaction"
+        self._txn_done = 0
+        self._txn_total: int | None = None
+        self._dl_done = 0
+        self._dl_total: int | None = None
         # Bumped on every ``_populate_options``; a lazy full-list stream aborts
         # when its captured generation goes stale (see ``_populate_options_lazy``).
         self._populate_generation = 0
@@ -1058,6 +1088,11 @@ class DnfseekApp(App):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        self._txn_phase = None
+        self._txn_done = 0
+        self._txn_total = None
+        self._dl_done = 0
+        self._dl_total = None
 
         async def drain(stream) -> bytes:
             chunks: list[bytes] = []
@@ -1074,9 +1109,59 @@ class DnfseekApp(App):
         await process.wait()
         return process.returncode or 0, stderr
 
+    def _progress(self) -> tuple[int | None, int | None]:
+        """Current ``(done, total)`` for the active phase, or ``(None, None)``.
+
+        Download numbers come from the ``[N/M]`` counters; transaction totals
+        come from the stdout summary block (so they count packages, not
+        housekeeping steps).
+        """
+        if self._txn_phase == "transaction":
+            return self._txn_done, self._txn_total
+        if self._txn_phase == "download":
+            return self._dl_done, self._dl_total
+        return None, None
+
+    def _parse_progress_line(self, line: str) -> None:
+        """Update transaction progress state from one streamed dnf line.
+
+        See the ``_PROGRESS_*`` constants for the formats (verified against a
+        real dnf5 5.4.5 capture). stdout and stderr arrive interleaved from
+        two drains, so the "Transaction Summary:" totals may land before or
+        after the stderr item lines; download counters and the summary block
+        therefore keep SEPARATE totals. ``_txn_total`` accumulates summary
+        counts only — the run counter's ``M`` includes housekeeping steps, so
+        it must never seed the transaction total.
+        """
+        if line == "Running transaction":
+            self._txn_phase = "transaction"
+            return
+        if line == "Complete!":
+            if self._txn_total is not None:
+                self._txn_done = self._txn_total
+            return
+        item = _PROGRESS_ITEM_RE.match(line)
+        if item is not None:
+            current, total, token = int(item[1]), int(item[2]), item[3]
+            if token in _PROGRESS_VERBS:
+                self._txn_phase = "transaction"
+                self._txn_done += 1
+            elif self._txn_phase != "transaction":
+                self._txn_phase = "download"
+                self._dl_done, self._dl_total = current, total
+            return
+        summary = _PROGRESS_SUMMARY_RE.match(line)
+        if summary is not None:
+            self._txn_total = (self._txn_total or 0) + int(summary[2])
+
     def _handle_stream_line(self, line: str) -> None:
-        """Per-line sink for ``_sudo_once`` streams: append to ``#right_panel``."""
+        """Per-line sink for ``_sudo_once`` streams.
+
+        Appends the line to the ``#right_panel`` log and feeds the
+        transaction progress parser.
+        """
         self.query_one("#right_panel", RichLog).write(line)
+        self._parse_progress_line(line)
 
     @staticmethod
     def _action_status(args: list[str], name: str | None) -> str:

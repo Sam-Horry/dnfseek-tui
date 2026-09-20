@@ -38,6 +38,8 @@ from textual.widgets import (
     Footer,
     OptionList,
     LoadingIndicator,
+    RichLog,
+    ProgressBar,
 )
 # ``Option`` is NOT exported from ``textual.widgets`` in textual 8.2.8, so it
 # must be imported from the private ``_option_list`` module. Used to build the
@@ -78,6 +80,28 @@ FILTER_DEBOUNCE = 0.06  # seconds of quiet before the list is re-filtered
 LAZY_THRESHOLD = 2000
 LAZY_CHUNK = 2000
 LAZY_PAUSE = 0.01  # seconds between chunks (let the screen paint)
+
+# Live dnf5 transaction progress parsing (formats verified against a real
+# 5.4.5 capture, see PLAN.md). Downloads stream as
+# ``[N/M] <nevra> 100% | speed | size | time`` (no verb); the transaction
+# prints ``Running transaction`` then ``[N/M] <Verb> <nevra> 100% | ...`` per
+# package op, with "Verify package files"/"Prepare transaction" housekeeping
+# steps in between (not package ops). NOTE: dnf5 space-pads the counter to
+# the width of M ("[ 3/16]"), so the item regex must tolerate spaces after
+# "[" (the user's 7-package downgrade capture showed this). A "Removing"
+# step is the shadow op of a
+# package the summary already counted (as "Replacing:"/reinstall), so it
+# counts toward done. Totals come from the "Transaction Summary:" block on
+# stdout, one `` <Verb>:   N package`` line per op category (gettext singular
+# and plural).
+_PROGRESS_VERBS = frozenset(
+    {"Installing", "Upgrading", "Reinstalling", "Downgrading", "Replacing", "Removing"}
+)
+_PROGRESS_ITEM_RE = re.compile(r"^\[\s*(\d+)\s*/\s*(\d+)\]\s+(\S+)\b")
+_PROGRESS_SUMMARY_RE = re.compile(
+    r"^\s*(Installing|Reinstalling|Upgrading|Replacing|Removing|Downgrading):"
+    r"\s*(\d+)\s+packages?\s*$"
+)
 
 
 class PackageList(OptionList):
@@ -135,7 +159,7 @@ class DnfseekApp(App):
         ``main.tcss`` sets ``display: none``) and ``#options_text``.
       * ``#input`` — client-side filter over the in-memory list.
       * ``#left_panel`` — this ``PackageList`` (virtualized OptionList).
-      * ``#right_panel`` — info/deps/output preview ``Static``.
+      * ``#right_panel`` — info/deps/output preview ``RichLog`` (scrollable).
     """
 
     CSS_PATH = "main.tcss"
@@ -191,6 +215,17 @@ class DnfseekApp(App):
         # True while a dnf action's status owns ``#options_text`` — keeps
         # ``_populate_options``'s match-count hint from clobbering it.
         self._status_active = False
+        # Live transaction progress, parsed from the streamed dnf5 output by
+        # ``_parse_progress_line`` (rendered by the ``#options`` progress bar;
+        # reset at the start of every ``_sudo_once``). Download-phase numbers
+        # are counter-based (``_dl_*``); transaction ``_txn_total`` comes from
+        # the "Transaction Summary:" block because the run counter's M
+        # includes non-package housekeeping steps.
+        self._txn_phase: str | None = None  # None | "download" | "transaction"
+        self._txn_done = 0
+        self._txn_total: int | None = None
+        self._dl_done = 0
+        self._dl_total: int | None = None
         # Bumped on every ``_populate_options``; a lazy full-list stream aborts
         # when its captured generation goes stale (see ``_populate_options_lazy``).
         self._populate_generation = 0
@@ -201,18 +236,30 @@ class DnfseekApp(App):
         with Horizontal(id="options"):  # styled by the ``#options`` rule (height: 3)
             yield LoadingIndicator(id="spinner", classes="hidden")  # toggled by ``_show_status``/``_hide_status``
             yield Static(DEFAULT_HINT, id="options_text")
+            # Live-transaction progress cluster ``<done> [bar] <total>``,
+            # unhidden by ``_update_progress_ui`` once dnf reports counts.
+            yield Static(id="progress_count", classes="hidden")
+            yield ProgressBar(
+                id="progress_bar",
+                show_percentage=False,
+                show_eta=False,
+                classes="hidden",
+            )
+            yield Static(id="progress_total", classes="hidden")
 
         with Horizontal():
             with Vertical():
                 yield DnfseekInput(placeholder="Type Package Name", id="input")
                 yield PackageList(id="left_panel", markup=False)
-            yield Static("Select a package (enter/space) to view its information", id="right_panel", markup=False)
+            # Scrollable info/deps/output log (wraps dnf5's wide tables).
+            yield RichLog(id="right_panel", wrap=True, markup=False, max_lines=2000)
         yield Footer()
 
     def on_mount(self) -> None:
         """Boot straight into "Search all" so the list is never blank."""
         self.theme_changed_signal.subscribe(self, self._save_theme)
         self.styles.scrollbar_visibility = "hidden"
+        self._show_panel("Select a package (enter/space) to view its information")
         # Runs ``_show_packages(installed_only=False)`` in a worker; the
         # ``exclusive=True`` group cancels any prior search worker mid-flight.
         self.run_worker(
@@ -693,14 +740,15 @@ class DnfseekApp(App):
         if name is None:
             return
         self._active_package = name
-        right_panel = self.query_one("#right_panel", Static)
         if name in self._info_cache:
-            right_panel.update(self._format_info(name, self._info_cache[name]))
+            if not self._status_active:
+                self._show_panel(self._format_info(name, self._info_cache[name]))
             return
         if name in self._pending_fetches:
             return
         self._pending_fetches.add(name)
-        right_panel.update(f"Fetching info for {name}...")
+        if not self._status_active:
+            self._show_panel(f"Fetching info for {name}...")
         self.run_worker(
             self._fetch_package_info(name),
             name=f"info-{name}",
@@ -715,7 +763,10 @@ class DnfseekApp(App):
         (Name/Summary/Version/Release/Size/URL/Description) rather than render
         the full output — see PLAN.md bundle 3 for the proposed full-output tab.
         The ``name == self._active_package`` guard avoids clobbering the panel
-        if the user selected a different package while this fetch ran.
+        if the user selected a different package while this fetch ran, and the
+        ``not _status_active`` guard keeps a late render from splicing itself
+        into a dnf action's streaming log (the action's completion path
+        re-renders the panel when it ends).
         """
         process = await asyncio.create_subprocess_exec(
             "dnf", "info", name,
@@ -733,10 +784,8 @@ class DnfseekApp(App):
         ]
         info = "\n".join(lines)
         self._info_cache[name] = info
-        if name == self._active_package:
-            self.query_one("#right_panel", Static).update(
-                self._format_info(name, info)
-            )
+        if name == self._active_package and not self._status_active:
+            self._show_panel(self._format_info(name, info))
 
     def action_install(self) -> None:
         """``i`` — install the highlighted package via ``dnf install``.
@@ -836,6 +885,7 @@ class DnfseekApp(App):
                 ["dnf", "upgrade", "-y", name],
                 success_msg=f"Updated: {name}",
                 name=name,
+                installed="upgrade",
             ),
             name=f"update-{name}",
             group="dnf",
@@ -854,11 +904,10 @@ class DnfseekApp(App):
         if name is None:
             self.notify("No package selected", severity="warning")
             return
-        right_panel = self.query_one("#right_panel", Static)
         if name in self._deps_cache:
-            right_panel.update(self._format_info(name, self._deps_cache[name]))
+            self._show_panel(self._format_info(name, self._deps_cache[name]))
             return
-        right_panel.update(f"Fetching dependencies for {name}...")
+        self._show_panel(f"Fetching dependencies for {name}...")
         self.run_worker(
             self._fetch_deps(name),
             name=f"deps-{name}",
@@ -874,27 +923,27 @@ class DnfseekApp(App):
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, _ = await process.communicate()
-        right_panel = self.query_one("#right_panel", Static)
         if process.returncode != 0:
-            right_panel.update(f"Could not fetch dependencies for {name}")
+            self._show_panel(f"Could not fetch dependencies for {name}")
             self.notify(f"Could not fetch dependencies for {name}", severity="error")
             return
         deps = [line.strip() for line in stdout.decode().splitlines() if line.strip()]
         text = "\n".join(deps) if deps else "No dependencies"
         self._deps_cache[name] = text
-        right_panel.update(self._format_info(name, text))
+        self._show_panel(self._format_info(name, text))
 
     def _restore_package_info(self, name: str) -> None:
         """Re-show info for a package after a dnf action mutated state.
 
-        Cache hit → render immediately; otherwise kick a fresh ``dnf info``
-        fetch (the cached entry was just invalidated by ``_mark_*``).
+        Cache hit → render immediately; a fetch already in flight is left to
+        render on completion; otherwise kick a fresh ``dnf info`` fetch (the
+        cached entry was just invalidated by ``_mark_*``).
         """
         self._active_package = name
         if name in self._info_cache:
-            self.query_one("#right_panel", Static).update(
-                self._format_info(name, self._info_cache[name])
-            )
+            self._show_panel(self._format_info(name, self._info_cache[name]))
+        elif name in self._pending_fetches:
+            return
         else:
             self.run_worker(
                 self._fetch_package_info(name),
@@ -941,6 +990,61 @@ class DnfseekApp(App):
             exit_on_error=False,
         )
 
+    def _mark_upgraded(self, name: str) -> None:
+        """Drop ``name`` from ``_upgradable`` and invalidate its cached info.
+
+        The package stays installed, so installed/available sets are
+        untouched; the disk caches are re-synced to keep the upgradable file
+        consistent (mirrors ``_mark_installed``).
+        """
+        self._upgradable.discard(name)
+        self._info_cache.pop(name, None)
+        self._deps_cache.pop(name, None)
+        self._rebuild_view_names(self._view_mode)
+        self._populate_options()
+        self.run_worker(
+            self._sync_cache_files(),
+            name="cache-sync",
+            group="cache",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _sync_after_upgrade_all(self) -> None:
+        """Post-upgrade-all state sync (the ⬆️-markers-stay-stale bug fix).
+
+        ``dnf upgrade -y`` reports progress but, on success, previously did
+        NOT touch any app state — markers, the upgradable view and cached
+        info all stayed stale. This syncs: snapshot the pending set, clear
+        it, invalidate info/deps caches for those packages (a cache hit
+        would otherwise render old versions), re-render instantly, then
+        re-check the upgradable set in the background to re-add anything dnf
+        skipped or that became pending meanwhile (repoquery is the ground
+        truth — ``upgrade -y`` can leave stragglers). Restoring the selected
+        package's info panel is owned by ``_run_dnf`` (it must happen after
+        ``_hide_status``).
+        """
+        pending = set(self._upgradable)
+        self._upgradable.clear()
+        for name in pending:
+            self._info_cache.pop(name, None)
+            self._deps_cache.pop(name, None)
+        self._rebuild_view_names(self._view_mode)
+        self._populate_options()
+        output = await self._dnf_list(
+            ["repoquery", "--upgrades", "--queryformat", "%{name}.%{arch}\n"]
+        )
+        remaining_names = self._parse_repoquery_set(output) if output else []
+        if remaining_names:
+            self._upgradable |= set(remaining_names)
+            self._rebuild_view_names(self._view_mode)
+            self._populate_options()
+            self.notify(
+                f"{len(remaining_names)} package(s) still have pending updates",
+                severity="warning",
+            )
+        await self._write_cache(UPGRADABLE_CACHE, remaining_names)
+
     async def _sync_cache_files(self) -> None:
         """Rewrite all three cache files from the current in-memory sets."""
         await asyncio.gather(
@@ -956,6 +1060,7 @@ class DnfseekApp(App):
             self._run_dnf(
                 ["dnf", "upgrade", "-y"],
                 success_msg="All packages upgraded!",
+                installed="upgrade_all",
             ),
             name="upgrade_all",
             group="dnf",
@@ -985,16 +1090,22 @@ class DnfseekApp(App):
             "no password was provided") → notify + ``self.exit(result=...)``,
             which ``main()`` prints to stderr after the TUI restores the
             terminal. There is no in-app reauth path.
-          * returncode 0 → notify success, apply the cache-set mutation
-            (``installed="add"|"remove"``), refresh the panel.
+          * returncode 0 → notify success, then apply the post-transaction
+            cache-set mutation: ``installed="add"|"remove"|"upgrade"`` runs
+            the matching ``_mark_*`` helper for ``name``; ``"upgrade_all"``
+            runs the full ``_sync_after_upgrade_all`` sync; ``name`` alone
+            just marks the info panel for restore. The restore itself runs
+            AFTER ``_hide_status`` — an in-flight info fetch whose completion
+            render is suppressed while ``_status_active`` would otherwise
+            leave the panel on the dnf transcript.
           * non-zero → surface the last 10 stderr lines in ``#right_panel``
             and classify the common dnf messages (already installed /
             already latest / nothing-to-do) into friendlier notifications.
         """
-        right_panel = self.query_one("#right_panel", Static)
         self._show_status(self._action_status(args, name))
+        restore_name: str | None = None
         try:
-            right_panel.update(f"Running: {' '.join(args)}")
+            self._show_panel(f"Running: {' '.join(args)}")
             returncode, stderr = await self._sudo_once(args)
             if returncode != 0 and (
                 b"a password is required" in stderr.lower()
@@ -1013,18 +1124,24 @@ class DnfseekApp(App):
                 self.notify(success_msg, timeout=2, severity="information")
                 if installed == "add" and name is not None:
                     self._mark_installed(name)
-                    self._restore_package_info(name)
+                    restore_name = name
                 elif installed == "remove" and name is not None:
                     self._mark_removed(name)
-                    self._restore_package_info(name)
+                    restore_name = name
+                elif installed == "upgrade" and name is not None:
+                    self._mark_upgraded(name)
+                    restore_name = name
+                elif installed == "upgrade_all":
+                    await self._sync_after_upgrade_all()
+                    restore_name = self._active_package
                 elif name is not None:
-                    self._restore_package_info(name)
+                    restore_name = name
             else:
                 stderr_text = stderr.decode(errors="replace")
                 error_text = stderr_text.lower()
                 if stderr:
                     error_lines = stderr_text.splitlines()[-10:]
-                    right_panel.update("\n".join(error_lines))
+                    self._show_panel("\n".join(error_lines))
                 if "already installed" in error_text:
                     self.notify(
                         f"{name or 'Package'} is already installed", severity="warning"
@@ -1041,36 +1158,138 @@ class DnfseekApp(App):
                     )
         finally:
             self._hide_status()
+        if restore_name is not None:
+            self._restore_package_info(restore_name)
 
     async def _sudo_once(self, args: list[str]) -> tuple[int, bytes]:
-        """Run ``sudo -n <cmd> ...`` once, streaming stdout to ``#right_panel``.
+        """Run ``sudo -n <cmd> ...`` once, streaming both pipes to ``#right_panel``.
 
         Non-interactive sudo (validated up front by ``main()``'s ``sudo -v``).
-        stdout is streamed line-by-line into the panel showing only the last
-        15 lines (a scrollback-preserving RichLog is planned per PLAN.md).
-        stderr is read in parallel (``stderr_task``) so stderr buffering can't
-        deadlock the streaming stdout. ``--requires``-style messages are
-        matched case-insensitively against the raw **bytes** (``stderr.lower()``)
-        rather than decoded text, which is why the literals are byte strings.
-        Returns ``(returncode, stderr_bytes)``; ``returncode or 0`` coerces the
-        ``None`` that ``create_subprocess_exec`` can leave behind before wait().
+        stdout AND stderr are drained concurrently into the panel log — every
+        line is appended (full transcript, scrollback preserved). stderr is
+        streamed live rather than read once at the end because dnf5 >= 5.2
+        prints its live progress bars to stderr (dnf5 PR #1641); concurrent
+        drains also keep either pipe's buffering from deadlocking the other.
+        Every clean line goes through ``_handle_stream_line``. sudo-expiry
+        messages are matched case-insensitively against the raw **bytes**
+        (``stderr.lower()`` in ``_run_dnf``) rather than decoded text, which is
+        why the return value keeps stderr as bytes. Returns
+        ``(returncode, stderr_bytes)``; ``returncode or 0`` coerces the ``None``
+        that ``create_subprocess_exec`` can leave behind before wait().
         """
-        right_panel = self.query_one("#right_panel", Static)
         process = await asyncio.create_subprocess_exec(
             "sudo", "-n", *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stderr_task = asyncio.create_task(process.stderr.read())
-        lines: list[str] = []
-        async for chunk in process.stdout:
-            for line in chunk.decode(errors="replace").replace("\r", "\n").splitlines():
-                if line.strip():
-                    lines.append(line.strip())
-            right_panel.update("\n".join(lines[-15:]))
+        self._txn_phase = None
+        self._txn_done = 0
+        self._txn_total = None
+        self._dl_done = 0
+        self._dl_total = None
+
+        async def drain(stream) -> bytes:
+            chunks: list[bytes] = []
+            async for chunk in stream:
+                chunks.append(chunk)
+                for line in chunk.decode(errors="replace").replace("\r", "\n").splitlines():
+                    if line.strip():
+                        self._handle_stream_line(line.strip())
+            return b"".join(chunks)
+
+        stderr_task = asyncio.create_task(drain(process.stderr))
+        await drain(process.stdout)
         stderr = await stderr_task
         await process.wait()
         return process.returncode or 0, stderr
+
+    def _progress(self) -> tuple[int | None, int | None]:
+        """Current ``(done, total)`` for the active phase, or ``(None, None)``.
+
+        Download numbers come from the ``[N/M]`` counters; transaction totals
+        come from the stdout summary block (so they count packages, not
+        housekeeping steps).
+        """
+        if self._txn_phase == "transaction":
+            return self._txn_done, self._txn_total
+        if self._txn_phase == "download":
+            return self._dl_done, self._dl_total
+        return None, None
+
+    def _parse_progress_line(self, line: str) -> None:
+        """Update transaction progress state from one streamed dnf line.
+
+        See the ``_PROGRESS_*`` constants for the formats (verified against a
+        real dnf5 5.4.5 capture). stdout and stderr arrive interleaved from
+        two drains, so the "Transaction Summary:" totals may land before or
+        after the stderr item lines; download counters and the summary block
+        therefore keep SEPARATE totals. ``_txn_total`` accumulates summary
+        counts only — the run counter's ``M`` includes housekeeping steps, so
+        it must never seed the transaction total.
+        """
+        if line == "Running transaction":
+            self._txn_phase = "transaction"
+            return
+        if line == "Complete!":
+            if self._txn_total is not None:
+                self._txn_done = self._txn_total
+            return
+        item = _PROGRESS_ITEM_RE.match(line)
+        if item is not None:
+            current, total, token = int(item[1]), int(item[2]), item[3]
+            if token in _PROGRESS_VERBS:
+                self._txn_phase = "transaction"
+                self._txn_done += 1
+            elif self._txn_phase != "transaction":
+                self._txn_phase = "download"
+                self._dl_done, self._dl_total = current, total
+            return
+        summary = _PROGRESS_SUMMARY_RE.match(line)
+        if summary is not None:
+            self._txn_total = (self._txn_total or 0) + int(summary[2])
+
+    def _handle_stream_line(self, line: str) -> None:
+        """Per-line sink for ``_sudo_once`` streams.
+
+        Appends the line to the ``#right_panel`` log and feeds the
+        transaction progress parser.
+        """
+        self.query_one("#right_panel", RichLog).write(line)
+        self._parse_progress_line(line)
+        self._update_progress_ui()
+
+    def _hide_progress_widgets(self) -> None:
+        """Re-hide the ``#options`` progress cluster (done | bar | total)."""
+        for widget_id in ("#progress_count", "#progress_bar", "#progress_total"):
+            self.query_one(widget_id).add_class("hidden")
+
+    def _update_progress_ui(self) -> None:
+        """Un-hide and refresh the ``#options`` progress cluster.
+
+        Reads ``_progress()``: with a known total the bar is determinate and
+        ``#progress_count``/``#progress_total`` show the done/total package
+        numbers (done left of the bar, total right); with total unknown the
+        bar is indeterminate (animated — so it doubles as the spinner while
+        running, which is why the spinner hides once the bar shows).
+        """
+        done, total = self._progress()
+        if done is None:
+            return
+        count = self.query_one("#progress_count", Static)
+        bar = self.query_one("#progress_bar", ProgressBar)
+        total_label = self.query_one("#progress_total", Static)
+        for widget in (count, bar, total_label):
+            widget.remove_class("hidden")
+        self.query_one("#spinner", LoadingIndicator).add_class("hidden")
+        if total:
+            bar.total = total
+            bar.progress = min(done, total)
+            count.update(str(min(done, total)))
+            total_label.update(str(total))
+        else:
+            bar.total = None  # indeterminate animated bar
+            count.update("")
+            total_label.update("")
 
     @staticmethod
     def _action_status(args: list[str], name: str | None) -> str:
@@ -1088,6 +1307,12 @@ class DnfseekApp(App):
             return "Upgrading all packages..."
         return f"Running: {' '.join(args)}"
 
+    def _show_panel(self, text: str) -> None:
+        """Replace the ``#right_panel`` log content (RichLog: clear + write)."""
+        log = self.query_one("#right_panel", RichLog)
+        log.clear()
+        log.write(text)
+
     def _show_status(self, message: str) -> None:
         """Un-hide ``#spinner`` (the ``.hidden`` rule in main.tcss sets display:none) and set ``#options_text``.
 
@@ -1097,12 +1322,14 @@ class DnfseekApp(App):
         self._status_active = True
         self.query_one("#spinner", LoadingIndicator).remove_class("hidden")
         self.query_one("#options_text", Static).update(message)
+        self._hide_progress_widgets()
 
     def _hide_status(self) -> None:
         """Re-hide ``#spinner`` and restore ``#options_text`` to ``DEFAULT_HINT``."""
         self._status_active = False
         self.query_one("#spinner", LoadingIndicator).add_class("hidden")
         self.query_one("#options_text", Static).update(DEFAULT_HINT)
+        self._hide_progress_widgets()
 
 
 def main() -> None:

@@ -19,6 +19,21 @@ Horizontal {
     width: 1fr;
 }
 
+/* Live-transaction progress cluster (right edge of the status bar). */
+#progress_count {
+    width: 4;
+    text-align: right;
+}
+
+#progress_bar {
+    width: 20;
+    margin: 0 1;
+}
+
+#progress_total {
+    width: 5;
+}
+
 #spinner {
     width: 10;
     height: 1;

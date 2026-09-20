@@ -86,7 +86,10 @@ LAZY_PAUSE = 0.01  # seconds between chunks (let the screen paint)
 # ``[N/M] <nevra> 100% | speed | size | time`` (no verb); the transaction
 # prints ``Running transaction`` then ``[N/M] <Verb> <nevra> 100% | ...`` per
 # package op, with "Verify package files"/"Prepare transaction" housekeeping
-# steps in between (not package ops). A "Removing" step is the shadow op of a
+# steps in between (not package ops). NOTE: dnf5 space-pads the counter to
+# the width of M ("[ 3/16]"), so the item regex must tolerate spaces after
+# "[" (the user's 7-package downgrade capture showed this). A "Removing"
+# step is the shadow op of a
 # package the summary already counted (as "Replacing:"/reinstall), so it
 # counts toward done. Totals come from the "Transaction Summary:" block on
 # stdout, one `` <Verb>:   N package`` line per op category (gettext singular
@@ -94,7 +97,7 @@ LAZY_PAUSE = 0.01  # seconds between chunks (let the screen paint)
 _PROGRESS_VERBS = frozenset(
     {"Installing", "Upgrading", "Reinstalling", "Downgrading", "Replacing", "Removing"}
 )
-_PROGRESS_ITEM_RE = re.compile(r"^\[(\d+)/(\d+)\]\s+(\S+)\b")
+_PROGRESS_ITEM_RE = re.compile(r"^\[\s*(\d+)\s*/\s*(\d+)\]\s+(\S+)\b")
 _PROGRESS_SUMMARY_RE = re.compile(
     r"^\s*(Installing|Reinstalling|Upgrading|Replacing|Removing|Downgrading):"
     r"\s*(\d+)\s+packages?\s*$"

@@ -39,6 +39,7 @@ from textual.widgets import (
     OptionList,
     LoadingIndicator,
     RichLog,
+    ProgressBar,
 )
 # ``Option`` is NOT exported from ``textual.widgets`` in textual 8.2.8, so it
 # must be imported from the private ``_option_list`` module. Used to build the
@@ -232,6 +233,16 @@ class DnfseekApp(App):
         with Horizontal(id="options"):  # styled by the ``#options`` rule (height: 3)
             yield LoadingIndicator(id="spinner", classes="hidden")  # toggled by ``_show_status``/``_hide_status``
             yield Static(DEFAULT_HINT, id="options_text")
+            # Live-transaction progress cluster ``<done> [bar] <total>``,
+            # unhidden by ``_update_progress_ui`` once dnf reports counts.
+            yield Static(id="progress_count", classes="hidden")
+            yield ProgressBar(
+                id="progress_bar",
+                show_percentage=False,
+                show_eta=False,
+                classes="hidden",
+            )
+            yield Static(id="progress_total", classes="hidden")
 
         with Horizontal():
             with Vertical():
@@ -1162,6 +1173,40 @@ class DnfseekApp(App):
         """
         self.query_one("#right_panel", RichLog).write(line)
         self._parse_progress_line(line)
+        self._update_progress_ui()
+
+    def _hide_progress_widgets(self) -> None:
+        """Re-hide the ``#options`` progress cluster (done | bar | total)."""
+        for widget_id in ("#progress_count", "#progress_bar", "#progress_total"):
+            self.query_one(widget_id).add_class("hidden")
+
+    def _update_progress_ui(self) -> None:
+        """Un-hide and refresh the ``#options`` progress cluster.
+
+        Reads ``_progress()``: with a known total the bar is determinate and
+        ``#progress_count``/``#progress_total`` show the done/total package
+        numbers (done left of the bar, total right); with total unknown the
+        bar is indeterminate (animated — so it doubles as the spinner while
+        running, which is why the spinner hides once the bar shows).
+        """
+        done, total = self._progress()
+        if done is None:
+            return
+        count = self.query_one("#progress_count", Static)
+        bar = self.query_one("#progress_bar", ProgressBar)
+        total_label = self.query_one("#progress_total", Static)
+        for widget in (count, bar, total_label):
+            widget.remove_class("hidden")
+        self.query_one("#spinner", LoadingIndicator).add_class("hidden")
+        if total:
+            bar.total = total
+            bar.progress = min(done, total)
+            count.update(str(min(done, total)))
+            total_label.update(str(total))
+        else:
+            bar.total = None  # indeterminate animated bar
+            count.update("")
+            total_label.update("")
 
     @staticmethod
     def _action_status(args: list[str], name: str | None) -> str:
@@ -1194,12 +1239,14 @@ class DnfseekApp(App):
         self._status_active = True
         self.query_one("#spinner", LoadingIndicator).remove_class("hidden")
         self.query_one("#options_text", Static).update(message)
+        self._hide_progress_widgets()
 
     def _hide_status(self) -> None:
         """Re-hide ``#spinner`` and restore ``#options_text`` to ``DEFAULT_HINT``."""
         self._status_active = False
         self.query_one("#spinner", LoadingIndicator).add_class("hidden")
         self.query_one("#options_text", Static).update(DEFAULT_HINT)
+        self._hide_progress_widgets()
 
 
 def main() -> None:

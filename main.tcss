@@ -30,6 +30,10 @@ Horizontal {
     margin: 0 1;
 }
 
+#progress_bar > #bar {
+  width: 1fr;
+}
+
 #progress_total {
     width: 5;
 }

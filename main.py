@@ -226,6 +226,9 @@ class DnfseekApp(App):
         self._txn_total: int | None = None
         self._dl_done = 0
         self._dl_total: int | None = None
+        # True when dnf printed its "Nothing to do." no-op line during the
+        # current ``_sudo_once`` (dnf5 exits 0 for no-ops; see ``_run_dnf``).
+        self._dnf_noop = False
         # Bumped on every ``_populate_options``; a lazy full-list stream aborts
         # when its captured generation goes stale (see ``_populate_options_lazy``).
         self._populate_generation = 0
@@ -429,6 +432,10 @@ class DnfseekApp(App):
         (mirrors a plain ``dnf install``). Upgradable names come from
         ``dnf repoquery --upgrades`` (parsed by ``_parse_repoquery_set``) rather
         than a separate ``dnf list``, giving a clean ``name.arch`` set directly.
+        The upgradable query carries ``--refresh`` because it runs unprivileged
+        (user cache) while package actions run via sudo (root cache): without
+        it, newly published updates can be visible here but still absent from
+        the root cache a ``sudo dnf upgrade`` would resolve against.
         """
         self.notify("Refreshing package lists...", timeout=2)
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -439,7 +446,8 @@ class DnfseekApp(App):
                  "list", "--available"]
             ),
             self._dnf_list(
-                ["repoquery", "--upgrades", "--queryformat", "%{name}.%{arch}\n"]
+                ["--refresh", "repoquery", "--upgrades",
+                 "--queryformat", "%{name}.%{arch}\n"]
             ),
         )
         if installed is None or available is None:
@@ -863,11 +871,15 @@ class DnfseekApp(App):
         )
 
     def action_update_package(self) -> None:
-        """``g`` — upgrade one installed package via ``dnf upgrade``.
+        """``g`` — upgrade one installed package via ``dnf --refresh upgrade``.
 
-        Guards on ``self._upgradable`` (loaded by ``update_cache``) to refuse
-        packages with no pending upgrade. ``_upgradable`` may be empty if the
-        cache wasn't refreshed yet, in which case the guard is skipped.
+        The ``--refresh`` makes the privileged dnf re-check repo metadata
+        instead of trusting root's cache, which can predate the package
+        versions the (unprivileged) upgradable cache was built from — the
+        "markers say update, dnf says nothing to do" bug. Guards on
+        ``self._upgradable`` (loaded by ``update_cache``) to refuse packages
+        with no pending upgrade. ``_upgradable`` may be empty if the cache
+        wasn't refreshed yet, in which case the guard is skipped.
         """
         name = self._selected_package()
         if name is None:
@@ -882,7 +894,7 @@ class DnfseekApp(App):
         self.notify(f"Updating {name}...", timeout=2)
         self.run_worker(
             self._run_dnf(
-                ["dnf", "upgrade", "-y", name],
+                ["dnf", "--refresh", "upgrade", "-y", name],
                 success_msg=f"Updated: {name}",
                 name=name,
                 installed="upgrade",
@@ -1032,7 +1044,8 @@ class DnfseekApp(App):
         self._rebuild_view_names(self._view_mode)
         self._populate_options()
         output = await self._dnf_list(
-            ["repoquery", "--upgrades", "--queryformat", "%{name}.%{arch}\n"]
+            ["--refresh", "repoquery", "--upgrades",
+             "--queryformat", "%{name}.%{arch}\n"]
         )
         remaining_names = self._parse_repoquery_set(output) if output else []
         if remaining_names:
@@ -1054,11 +1067,14 @@ class DnfseekApp(App):
         )
 
     def _start_upgrade(self) -> None:
-        """Shared body of upgrade_all / action_upgrade_all — kicks ``dnf upgrade -y``."""
+        """Shared body of upgrade_all / action_upgrade_all.
+
+        Kicks the privileged ``dnf --refresh upgrade -y``.
+        """
         self.notify("Upgrading all packages...", timeout=2)
         self.run_worker(
             self._run_dnf(
-                ["dnf", "upgrade", "-y"],
+                ["dnf", "--refresh", "upgrade", "-y"],
                 success_msg="All packages upgraded!",
                 installed="upgrade_all",
             ),
@@ -1097,7 +1113,10 @@ class DnfseekApp(App):
             just marks the info panel for restore. The restore itself runs
             AFTER ``_hide_status`` — an in-flight info fetch whose completion
             render is suppressed while ``_status_active`` would otherwise
-            leave the panel on the dnf transcript.
+            leave the panel on the dnf transcript. A returncode-0 no-op
+            (dnf printed ``Nothing to do.``, e.g. because root's metadata
+            cache predates the update) instead notifies "already up to date"
+            and applies no cache-set mutation.
           * non-zero → surface the last 10 stderr lines in ``#right_panel``
             and classify the common dnf messages (already installed /
             already latest / nothing-to-do) into friendlier notifications.
@@ -1121,21 +1140,33 @@ class DnfseekApp(App):
                 )
                 return
             if returncode == 0:
-                self.notify(success_msg, timeout=2, severity="information")
-                if installed == "add" and name is not None:
-                    self._mark_installed(name)
-                    restore_name = name
-                elif installed == "remove" and name is not None:
-                    self._mark_removed(name)
-                    restore_name = name
-                elif installed == "upgrade" and name is not None:
-                    self._mark_upgraded(name)
-                    restore_name = name
-                elif installed == "upgrade_all":
-                    await self._sync_after_upgrade_all()
-                    restore_name = self._active_package
-                elif name is not None:
-                    restore_name = name
+                if self._dnf_noop:
+                    # dnf5 exits 0 on "Nothing to do.": report it honestly and
+                    # skip the cache-set mutation so markers stay in place
+                    # until a refresh establishes the real state.
+                    if installed == "upgrade" and name is not None:
+                        self.notify(f"{name} is already up to date", severity="warning")
+                    elif installed == "upgrade_all":
+                        self.notify("Packages are already up to date", severity="warning")
+                    else:
+                        self.notify("dnf reported nothing to do", severity="warning")
+                    restore_name = name if name is not None else self._active_package
+                else:
+                    self.notify(success_msg, timeout=2, severity="information")
+                    if installed == "add" and name is not None:
+                        self._mark_installed(name)
+                        restore_name = name
+                    elif installed == "remove" and name is not None:
+                        self._mark_removed(name)
+                        restore_name = name
+                    elif installed == "upgrade" and name is not None:
+                        self._mark_upgraded(name)
+                        restore_name = name
+                    elif installed == "upgrade_all":
+                        await self._sync_after_upgrade_all()
+                        restore_name = self._active_package
+                    elif name is not None:
+                        restore_name = name
             else:
                 stderr_text = stderr.decode(errors="replace")
                 error_text = stderr_text.lower()
@@ -1187,6 +1218,7 @@ class DnfseekApp(App):
         self._txn_total = None
         self._dl_done = 0
         self._dl_total = None
+        self._dnf_noop = False
 
         async def drain(stream) -> bytes:
             chunks: list[bytes] = []
@@ -1251,10 +1283,13 @@ class DnfseekApp(App):
     def _handle_stream_line(self, line: str) -> None:
         """Per-line sink for ``_sudo_once`` streams.
 
-        Appends the line to the ``#right_panel`` log and feeds the
-        transaction progress parser.
+        Appends the line to the ``#right_panel`` log, flags dnf5's
+        ``Nothing to do.`` no-op (which exits 0), and feeds the transaction
+        progress parser.
         """
         self.query_one("#right_panel", RichLog).write(line)
+        if line == "Nothing to do.":
+            self._dnf_noop = True
         self._parse_progress_line(line)
         self._update_progress_ui()
 

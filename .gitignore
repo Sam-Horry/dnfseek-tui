@@ -121,3 +121,6 @@ dmypy.json
 
 #Pycharm IDE
 .idea
+
+# Packaging Distribution
+packaging/README.md

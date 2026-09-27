@@ -50,11 +50,12 @@ executable, so no system Python packages are required.
 %autosetup -n %{name}-tui-%{version}
 
 %build
-# Freeze the app exactly like packaging/build-rpm.sh does locally. uv uses a
-# managed CPython 3.14 (python-build-standalone) plus the locked dependencies
-# from uv.lock, so the bundle does not depend on the chroot's interpreter or
-# Python packages. PyInstaller comes from PyPI (pinned below).
+# Freeze the app exactly like packaging/build-rpm.sh does locally. Fedora's uv
+# ships /etc/uv/uv.toml with python-downloads = "manual", so the managed
+# interpreter is installed explicitly (and UV_PYTHON_PREFERENCE=only-managed
+# keeps the bundle independent of the chroot's system Python).
 export UV_PYTHON_PREFERENCE=only-managed
+uv python install "3.14"
 uv run --frozen --python "3.14" \
     --with pyinstaller==%{pyinstaller_version} -- \
     pyinstaller --onefile --noconfirm --name dnfseek \

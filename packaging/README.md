@@ -55,3 +55,10 @@ Copr, which builds every enabled chroot. Users install with:
 sudo dnf copr enable myusername/dnfseek
 sudo dnf install dnfseek
 ```
+
+If a build fails and you need to retry without cutting a new release, push
+the fix and run the workflow manually:
+
+```bash
+gh workflow run copr.yml
+```

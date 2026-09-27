@@ -9,7 +9,10 @@ which is a fork of this [`project`](https://github.com/OmarHesham2356/dnfseek) o
 ## Prerequisites
 
 - Fedora (or another dnf-based distro)
-- [`uv`](https://docs.astral.sh/uv/) — `curl -LsSf https://astral.sh/uv/install.sh | sh` (recommended)
+
+If installing it as a uv tool:
+
+- [`uv`](https://docs.astral.sh/uv/) — `curl -LsSf https://astral.sh/uv/install.sh | sh`
 
 ## Test it out
 
@@ -21,13 +24,22 @@ uvx dnfseek
 
 ## Installation
 
-### From git
+### From Copr (Fedora)
 
 ```bash
-uv tool install git+https://github.com/Sam-Horry/dnfseek-tui
+sudo dnf copr enable sam-horry/dnfseek
+sudo dnf install dnfseek
 ```
 
-### From PyPI (recommended)
+It is currently built for Fedora 44 and Rawhide on x86_64,
+and updates arrive through `dnf upgrade`. If you would like dnfseek
+for other Fedora versions let me know!
+
+If you previously installed dnfseek with `uv tool`, remove that copy
+(`uv tool uninstall dnfseek`) so it doesn't shadow `/usr/bin/dnfseek` on your
+`PATH`.
+
+### As a uv tool
 
 ```bash
 uv tool install dnfseek
@@ -61,11 +73,18 @@ All the above actions can be performed from the command palette, as well as:
 | Command | Action |
 | --------- | -------- |
 | Search all | Search all available packages |
+| Search upgradeable | Search packages that have pending upgrades |
 | Search installed | Search installed packages |
 | Theme | Change the app theme |
 | Keys | Shows a help widget with a summary of available keys |
 
 ## Updating
+
+If installed via the Copr repository, you can upgrade dnfseek using dnf
+(and you can technically upgrade dnfseek using dnfseek!)
+
+If installed as a uv tool, you will have to manually update
+dnfseek by running:
 
 ```bash
 uv tool upgrade dnfseek
@@ -74,12 +93,11 @@ uv tool upgrade dnfseek
 ## Notes
 
 - This tool is basically a wrapper for dnf, with only a few commands at the moment.
+- I have confirmed that this tool works on my personal Fedora laptop, running Fedora 44.
+  It may work on other dnf-based systems, but they are untested,
+  and I can't guarantee they will work.
 - This tool is provided as-is, use at your own risk. I am not liable if something goes
   wrong - though in practice, dnf makes it pretty hard to brick your system.
   Most mistakes are recoverable with a rollback or `dnf history undo`
-- Installed as a tool, the binary lives in `~/.local/bin/dnfseek`, which
-  takes precedence over a `dnfseek` script elsewhere on your PATH.
 - Sudo authentication happens once, before the TUI starts. If your sudo
   session expires mid-session, restart the app to re-authenticate.
-- Requires Python 3.12+; `uv` downloads a compatible interpreter if your
-  system Python is older.

@@ -1,0 +1,68 @@
+name: Build on Copr
+
+# Build a source RPM on every version tag (v*) and submit it to Copr, which
+# builds the binary RPM in its own chroots. The Copr project must have
+# internet access enabled: PyInstaller is not packaged in Fedora, so %build
+# fetches it and the locked Python dependencies from PyPI.
+#
+# One-time setup (see packaging/README.md):
+#   secret   COPR_CONFIG   contents of ~/.config/copr (API token)
+#   variable COPR_PROJECT  e.g. myusername/dnfseek
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  copr:
+    runs-on: ubuntu-latest
+    container: fedora:44
+    steps:
+      - name: Install build tools
+        run: dnf install -y copr-cli git python3 rpm-build tar gzip
+
+      - uses: actions/checkout@v4
+
+      - name: Build source RPM
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          spec_version="$(sed -n 's/^Version:[[:space:]]*//p' packaging/dnfseek.spec)"
+          if [[ "$version" != "$spec_version" ]]; then
+            echo "error: pyproject.toml version $version != packaging/dnfseek.spec Version $spec_version" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v${version}" ]]; then
+            echo "error: tag $GITHUB_REF_NAME does not match version $version" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          git archive --prefix="dnfseek-tui-${version}/" \
+              -o "dist/dnfseek-tui-${version}.tar.gz" HEAD
+          rpmbuild -bs packaging/dnfseek.spec \
+              --define "_sourcedir $PWD/dist" \
+              --define "_srcrpmdir $PWD/dist" \
+              --define "_topdir $PWD/build/rpmbuild"
+
+      - name: Keep the source RPM as an artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: srpm
+          path: dist/*.src.rpm
+
+      - name: Submit to Copr
+        env:
+          COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
+          COPR_PROJECT: ${{ vars.COPR_PROJECT }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${COPR_CONFIG:-}" || -z "${COPR_PROJECT:-}" ]]; then
+            echo "error: set the COPR_CONFIG secret and COPR_PROJECT variable first" >&2
+            exit 1
+          fi
+          mkdir -p ~/.config
+          printf '%s\n' "$COPR_CONFIG" > ~/.config/copr
+          copr-cli build "$COPR_PROJECT" dist/*.src.rpm

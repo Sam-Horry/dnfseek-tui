@@ -99,5 +99,8 @@ uv tool upgrade dnfseek
 - This tool is provided as-is, use at your own risk. I am not liable if something goes
   wrong - though in practice, dnf makes it pretty hard to brick your system.
   Most mistakes are recoverable with a rollback or `dnf history undo`
-- Sudo authentication happens once, before the TUI starts. If your sudo
-  session expires mid-session, restart the app to re-authenticate.
+- Sudo authentication happens once, before the TUI starts. While the app is
+  in active use, a background keepalive refreshes the sudo timestamp every
+  minute (it stops after 30 minutes with no package action), so the session
+  normally doesn't lapse mid-run. If it does still expire (system sleep, or
+  `sudo -K` in another terminal), restart the app to re-authenticate.

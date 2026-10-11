@@ -8,7 +8,11 @@ the cross-references noted throughout the comments below.
 
 Run with ``uv run main.py`` (or the installed ``dnfseek`` console script).
 A ``sudo -v`` gate runs before the TUI starts (see ``main()``); package
-actions later call ``sudo -n``, with no in-app reauthentication.
+actions later call ``sudo -n``. While the app is in active use a background
+keepalive (``_keepalive_sudo``) refreshes the sudo timestamp so the session
+does not lapse mid-run (see ``KEEPALIVE_*``); there is still no in-app
+reauthentication, so if the timestamp does lapse (system sleep, ``sudo -K``
+elsewhere) the next privileged action exits the app for a fresh ``sudo -v``.
 """
 
 import asyncio
@@ -66,6 +70,16 @@ DEFAULT_HINT = "Search for a package, and press TAB to switch focus"
 # Built-in command-palette entries hidden from the palette (see
 # ``get_system_commands``); Theme/Quit/Keys still appear.
 HIDDEN_SYSTEM_COMMANDS = {"Screenshot", "Maximize", "Minimize"}
+
+# Sudo keepalive (see ``_keepalive_sudo``): refreshes the cached credential
+# with ``sudo -n -v`` every ``KEEPALIVE_INTERVAL`` seconds so the pre-launch
+# ``sudo -v`` timestamp doesn't lapse mid-session. 60s sits safely below
+# sudo's default 5-minute ``timestamp_timeout``. Refreshing stops once no
+# privileged action has run for ``KEEPALIVE_WINDOW`` seconds — an unattended
+# app must not hold root indefinitely; after that the next privileged action
+# hits the usual expiry path and exits.
+KEEPALIVE_INTERVAL = 60.0  # seconds between ``sudo -n -v`` refreshes
+KEEPALIVE_WINDOW = 30 * 60.0  # stop refreshing after this long without an action
 
 # Fuzzy-search tuning: cap displayed matches so the per-keystroke OptionList
 # rebuild stays cheap (~50ms), and debounce rapid typing before re-ranking.
@@ -215,6 +229,11 @@ class DnfseekApp(App):
         # True while a dnf action's status owns ``#options_text`` — keeps
         # ``_populate_options``'s match-count hint from clobbering it.
         self._status_active = False
+        # Monotonic timestamp of the last privileged action (stamped at the
+        # top of ``_run_dnf``); the sliding anchor for the keepalive window
+        # (``KEEPALIVE_WINDOW``). Starts at launch so the window stays bounded
+        # even before the first action.
+        self._last_sudo_action = time.monotonic()
         # Live transaction progress, parsed from the streamed dnf5 output by
         # ``_parse_progress_line`` (rendered by the ``#options`` progress bar;
         # reset at the start of every ``_sudo_once``). Download-phase numbers
@@ -269,6 +288,15 @@ class DnfseekApp(App):
             self._show_packages(mode="all"),
             name="search-all",
             group="search",
+            exclusive=True,
+            exit_on_error=False,
+        )
+        # Refresh the pre-launch sudo timestamp while the app is in use so it
+        # doesn't lapse mid-run (see ``_keepalive_sudo``).
+        self.run_worker(
+            self._keepalive_sudo(),
+            name="sudo-keepalive",
+            group="keepalive",
             exclusive=True,
             exit_on_error=False,
         )
@@ -1101,6 +1129,9 @@ class DnfseekApp(App):
     ) -> None:
         """Drive a privileged dnf action end-to-end: status → sudo → result.
 
+        Also stamps ``_last_sudo_action`` — the sliding anchor that keeps the
+        sudo keepalive (``_keepalive_sudo``) refreshing while the app sees use.
+
         Three branches after ``_sudo_once`` returns:
           * sudo expired (``sudo -n`` reports "a password is required" /
             "no password was provided") → notify + ``self.exit(result=...)``,
@@ -1121,6 +1152,7 @@ class DnfseekApp(App):
             and classify the common dnf messages (already installed /
             already latest / nothing-to-do) into friendlier notifications.
         """
+        self._last_sudo_action = time.monotonic()
         self._show_status(self._action_status(args, name))
         restore_name: str | None = None
         try:
@@ -1234,6 +1266,43 @@ class DnfseekApp(App):
         stderr = await stderr_task
         await process.wait()
         return process.returncode or 0, stderr
+
+    async def _keepalive_sudo(self) -> None:
+        """Refresh the cached sudo credential while the app is in active use.
+
+        Sudo's default ``timestamp_type=tty`` scopes the pre-launch ``sudo -v``
+        credential to this terminal; ``sudo -n -v`` re-validates it without
+        prompting and extends the timeout, so a session in active use never
+        lapses mid-run. stdin is inherited (not piped) for the same reason as
+        ``_sudo_once``: sudo must resolve the same tty record. Refreshes stop
+        once ``KEEPALIVE_WINDOW`` has passed since the last privileged action
+        (``_last_sudo_action``, stamped by ``_run_dnf``) — an unattended app
+        must not hold root indefinitely. A failed refresh (``sudo -K``
+        elsewhere, system sleep longer than the timeout) stops it early. Both
+        endings only notify: there is no in-app reauth, so the next privileged
+        action hits the usual expiry path in ``_run_dnf`` and exits.
+        """
+        while True:
+            await asyncio.sleep(KEEPALIVE_INTERVAL)
+            if time.monotonic() - self._last_sudo_action >= KEEPALIVE_WINDOW:
+                self.notify(
+                    "Sudo keepalive stopped (idle) — restart dnfseek when you "
+                    "need to re-authenticate",
+                    severity="warning",
+                )
+                return
+            process = await asyncio.create_subprocess_exec(
+                "sudo", "-n", "-v",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await process.communicate()
+            if process.returncode != 0:
+                self.notify(
+                    "Sudo session expired — please restart dnfseek",
+                    severity="error",
+                )
+                return
 
     def _progress(self) -> tuple[int | None, int | None]:
         """Current ``(done, total)`` for the active phase, or ``(None, None)``.

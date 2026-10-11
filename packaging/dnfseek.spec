@@ -14,7 +14,7 @@
 # submits it to Copr. See packaging/README.md for the one-time setup.
 
 Name:           dnfseek
-Version:        0.1.10
+Version:        0.1.11
 Release:        1%{?dist}
 Summary:        A TUI package browser for Fedora, built with Textual
 
@@ -69,5 +69,8 @@ install -Dpm 0755 dist/dnfseek %{buildroot}%{_bindir}/%{name}
 %{_bindir}/%{name}
 
 %changelog
+* Sun Oct 11 2026 Samuel Horry <211251918+Sam-Horry@users.noreply.github.com> - 0.1.11-1
+- Updated to use sudo keepalive so that the app stays open for 30 minutes instead of 5
+
 * Sun Sep 27 2026 Samuel Horry <211251918+Sam-Horry@users.noreply.github.com> - 0.1.9-1
 - Initial RPM: PyInstaller-bundled dnfseek with no Python runtime deps

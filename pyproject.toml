@@ -1,6 +1,6 @@
 [project]
 name = "dnfseek"
-version = "0.1.10"
+version = "0.1.11"
 description = "A TUI package browser for Fedora, built with Textual"
 readme = "README.md"
 license = "MIT"
